@@ -101,6 +101,63 @@ func buildExecutable(destination string, extraArguments ...string) error {
 	return nil
 }
 
+func TestProductHelpAndVersionDescribeTheStatelessTerminalExperience(t *testing.T) {
+	helpCommand := exec.Command(transferlyExecutable, "--help")
+	help, err := helpCommand.CombinedOutput()
+	if err != nil {
+		t.Fatalf("--help: %v\n%s", err, help)
+	}
+	for _, expected := range []string{
+		"discover Available Peers",
+		"connect <peer-number|IPv4:port>",
+		"compare the six-digit verification code",
+		"send <path>...",
+		"details",
+		"destination <path>",
+		"cancel",
+		"disconnect",
+		"keep-alive",
+		"quit",
+		"--name",
+		"--output",
+		"--listen",
+		"--version",
+		"No configuration, identity, trust, history, logs, telemetry, relay, or update checks are created.",
+	} {
+		if !strings.Contains(string(help), expected) {
+			t.Errorf("--help did not contain %q:\n%s", expected, help)
+		}
+	}
+
+	versionCommand := exec.Command(transferlyExecutable, "--version")
+	version, err := versionCommand.CombinedOutput()
+	if err != nil {
+		t.Fatalf("--version: %v\n%s", err, version)
+	}
+	if !strings.Contains(string(version), "Transferly dev") || !strings.Contains(string(version), "Wire protocol 3.0") {
+		t.Fatalf("--version did not report both versions:\n%s", version)
+	}
+}
+
+func TestTemporaryNameAndOutputFlagsApplyOnlyToTheCurrentProcess(t *testing.T) {
+	sender := startPeer(t, transferlyExecutable)
+	customOutput := filepath.Join(t.TempDir(), "Current Run Output")
+	receiver := startPeerWithArguments(t, transferlyExecutable, t.TempDir(), "--listen", "127.0.0.1:0", "--name", "TEMPORARY-PEER", "--output", customOutput)
+	receiver.waitFor(t, "Peer name: TEMPORARY-PEER")
+	receiver.waitFor(t, "Default incoming destination: "+customOutput+" (this run only)")
+	verifyPeers(t, sender, receiver)
+
+	sourcePath := filepath.Join(t.TempDir(), "flag-output.txt")
+	if err := os.WriteFile(sourcePath, []byte("temporary override"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sender.send(t, "send "+sourcePath)
+	receiver.waitFor(t, "Destination: "+customOutput)
+	receiver.send(t, "accept")
+	receiver.waitFor(t, "Received flag-output.txt")
+	assertFileContent(t, filepath.Join(customOutput, "flag-output.txt"), "temporary override")
+}
+
 func TestMixedFilesAndFoldersArePublishedAsOneTransferOffer(t *testing.T) {
 	sender := startPeer(t, transferlyExecutable)
 	receiver := startPeer(t, transferlyExecutable)
@@ -1393,8 +1450,13 @@ func startPeerAt(t *testing.T, executable, listenAddress string) *peerProcess {
 
 func startPeerAtWithHome(t *testing.T, executable, listenAddress, homeDir string) *peerProcess {
 	t.Helper()
+	return startPeerWithArguments(t, executable, homeDir, "--listen", listenAddress)
+}
+
+func startPeerWithArguments(t *testing.T, executable, homeDir string, arguments ...string) *peerProcess {
+	t.Helper()
 	workDir := t.TempDir()
-	command := exec.Command(executable, "--listen", listenAddress)
+	command := exec.Command(executable, arguments...)
 	command.Dir = workDir
 	command.Env = append(os.Environ(), "HOME="+homeDir, "USERPROFILE="+homeDir, "GOMEMLIMIT=24MiB")
 	stdin, err := command.StdinPipe()

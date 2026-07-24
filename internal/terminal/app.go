@@ -22,6 +22,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/Het-Jethva/Transferly/internal/discovery"
 	"github.com/Het-Jethva/Transferly/internal/session"
@@ -42,15 +44,18 @@ var errOfferCanceled = errors.New(reasonOfferCanceled)
 
 // Config contains process-lifetime settings. It is intentionally not persisted.
 type Config struct {
-	ListenAddress    string
-	Version          session.Version
-	ComputerName     string
-	Discovery        discovery.Multicast // Replaceable mDNS/DNS-SD boundary.
-	CorruptDigest    bool                // Used only by protocol-boundary integration builds.
-	IdleWarningAfter time.Duration
-	IdleTimeoutAfter time.Duration
-	StreamChunkDelay time.Duration // Nonzero only in process-level idle tests.
-	ControllableTime bool          // Enabled only in process-level idle tests.
+	ListenAddress      string
+	Version            session.Version
+	ProductVersion     string
+	ComputerName       string
+	DefaultDestination string
+	Discovery          discovery.Multicast                             // Replaceable mDNS/DNS-SD boundary.
+	PeerDial           func(context.Context, string) (net.Conn, error) // Explicit Peer connection boundary.
+	CorruptDigest      bool                                            // Used only by protocol-boundary integration builds.
+	IdleWarningAfter   time.Duration
+	IdleTimeoutAfter   time.Duration
+	StreamChunkDelay   time.Duration // Nonzero only in process-level idle tests.
+	ControllableTime   bool          // Enabled only in process-level idle tests.
 }
 
 // App owns one foreground listener and at most one Transfer Session.
@@ -165,8 +170,17 @@ func New(config Config, output io.Writer) (*App, error) {
 	if config.StreamChunkDelay < 0 {
 		return nil, errors.New("stream chunk delay cannot be negative")
 	}
+	if config.PeerDial == nil {
+		config.PeerDial = func(ctx context.Context, endpoint string) (net.Conn, error) {
+			dialer := net.Dialer{Timeout: connectTimeout}
+			return dialer.DialContext(ctx, "tcp4", endpoint)
+		}
+	}
 	if err := validateListenAddress(config.ListenAddress); err != nil {
 		return nil, err
+	}
+	if config.ProductVersion == "" {
+		config.ProductVersion = "dev"
 	}
 	if config.ComputerName == "" {
 		computerName, err := os.Hostname()
@@ -175,9 +189,25 @@ func New(config Config, output io.Writer) (*App, error) {
 		}
 		config.ComputerName = computerName
 	}
+	if err := validateComputerName(config.ComputerName); err != nil {
+		return nil, err
+	}
+	if config.DefaultDestination == "" {
+		destination, err := defaultDestination()
+		if err != nil {
+			return nil, fmt.Errorf("resolve Downloads destination: %w", err)
+		}
+		config.DefaultDestination = destination
+	} else {
+		destination, err := filepath.Abs(config.DefaultDestination)
+		if err != nil {
+			return nil, fmt.Errorf("resolve default incoming destination: %w", err)
+		}
+		config.DefaultDestination = filepath.Clean(destination)
+	}
 	listener, err := net.Listen("tcp4", config.ListenAddress)
 	if err != nil {
-		return nil, fmt.Errorf("listen on %s: %w", config.ListenAddress, err)
+		return nil, fmt.Errorf("listen on %s: %w. Check that the address is available and allow Transferly through Windows Firewall for the intended network profile; Transferly never requests elevation or changes firewall policy", config.ListenAddress, err)
 	}
 	clock := sessionClock(realSessionClock{})
 	if config.ControllableTime {
@@ -210,7 +240,9 @@ func New(config Config, output io.Writer) (*App, error) {
 // Run serves incoming Peers and handles commands until quit, end-of-input, or
 // an interrupt. It does not retain identity, trust, history, or configuration.
 func (a *App) Run(input io.Reader) error {
-	a.line("Transferly wire protocol %s", a.config.Version)
+	a.line("Transferly %s (wire protocol %s)", a.config.ProductVersion, a.config.Version)
+	a.line("Peer name: %s", a.config.ComputerName)
+	a.line("Default incoming destination: %s (this run only)", a.config.DefaultDestination)
 	for _, endpoint := range advertisedEndpoints(a.listener.Addr()) {
 		a.line("Endpoint: %s", endpoint)
 	}
@@ -348,6 +380,10 @@ func onePathArgument(argument string) (string, bool) {
 
 func (a *App) printCommands() {
 	a.line("Commands: connect <peer-number|IPv4:port>, send <path>..., cancel, keep-alive, disconnect, quit")
+	a.line("  connect: select a discovered Available Peer or enter a directly reachable IPv4 endpoint; compare and confirm the six-digit code on both terminals.")
+	a.line("  send: create a Transfer Offer from files and folders. The receiving Peer uses details, destination <path>, accept, or reject.")
+	a.line("  cancel: cancel the active Transfer Offer without ending the verified Transfer Session. Ctrl+C has the same effect during transfer.")
+	a.line("  keep-alive: deliberately reset the idle timeout. disconnect ends temporary trust; quit exits. Ctrl+C while idle disconnects and exits.")
 }
 
 func (a *App) connectTarget(target string) {
@@ -502,8 +538,7 @@ func (a *App) connect(endpoint string) {
 	a.line("Connecting to %s...", endpoint)
 	go func() {
 		defer current.finishOnce.Do(func() { close(current.finished) })
-		dialer := net.Dialer{Timeout: connectTimeout}
-		connection, err := dialer.DialContext(current.context, "tcp4", endpoint)
+		connection, err := a.config.PeerDial(current.context, endpoint)
 		if err != nil {
 			a.finishFailed(current)
 			a.line("Unable to connect to %s: %v. Check the IPv4 address, port, route, and Windows Firewall.", endpoint, err)
@@ -1170,11 +1205,7 @@ func (a *App) handleIncomingOffer(current *attempt, message session.Message) err
 	if _, err := hex.DecodeString(message.OfferID); err != nil {
 		return errors.New("Peer sent an invalid Transfer Offer identifier")
 	}
-	destination, err := defaultDestination()
-	if err != nil {
-		return fmt.Errorf("resolve Downloads destination: %w", err)
-	}
-	incoming := &incomingOffer{id: message.OfferID, destination: destination, actions: make(chan offerAction, 1), collecting: true, rootCount: message.RootCount}
+	incoming := &incomingOffer{id: message.OfferID, destination: a.config.DefaultDestination, actions: make(chan offerAction, 1), collecting: true, rootCount: message.RootCount}
 	incoming.manifest.FileCount, incoming.manifest.FolderCount, incoming.manifest.TotalBytes = message.FileCount, message.FolderCount, message.TotalBytes
 	a.mu.Lock()
 	if current.pendingIncoming == nil {
@@ -2243,6 +2274,18 @@ func (a *App) line(format string, arguments ...any) {
 	a.writeMu.Lock()
 	defer a.writeMu.Unlock()
 	_, _ = fmt.Fprintf(a.output, format+"\n", arguments...)
+}
+
+func validateComputerName(name string) error {
+	if strings.TrimSpace(name) == "" || len([]byte(name)) > 200 || !utf8.ValidString(name) {
+		return errors.New("computer name must contain 1 to 200 bytes of valid text")
+	}
+	for _, character := range name {
+		if unicode.IsControl(character) {
+			return errors.New("computer name cannot contain terminal control characters")
+		}
+	}
+	return nil
 }
 
 func validatePeerEndpoint(endpoint string) error {

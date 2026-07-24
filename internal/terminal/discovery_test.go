@@ -16,6 +16,51 @@ import (
 	"github.com/Het-Jethva/Transferly/internal/terminal"
 )
 
+func TestNetworkBoundaryUsesOnlyDiscoveryUntilAnExplicitPeerConnect(t *testing.T) {
+	multicast := newTerminalMulticast()
+	dials := make(chan string, 1)
+	output := newLockedOutput()
+	application, err := terminal.New(terminal.Config{
+		ListenAddress: "127.0.0.1:0",
+		Version:       session.Version{Major: 2},
+		ComputerName:  "LOCAL-LAPTOP",
+		Discovery:     multicast,
+		PeerDial: func(_ context.Context, endpoint string) (net.Conn, error) {
+			dials <- endpoint
+			return nil, errors.New("observed explicit test dial")
+		},
+	}, output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputReader, inputWriter := io.Pipe()
+	runDone := make(chan error, 1)
+	go func() { runDone <- application.Run(inputReader) }()
+	defer func() {
+		_, _ = io.WriteString(inputWriter, "quit\n")
+		_ = inputWriter.Close()
+		<-runDone
+	}()
+
+	multicast.waitForRegistration(t)
+	select {
+	case endpoint := <-dials:
+		t.Fatalf("Peer connection %q was attempted without an explicit connect command", endpoint)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	const endpoint = "192.0.2.10:53144"
+	_, _ = io.WriteString(inputWriter, "connect "+endpoint+"\n")
+	select {
+	case actual := <-dials:
+		if actual != endpoint {
+			t.Fatalf("dialed %q, want %q", actual, endpoint)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("explicit connect did not cross the Peer network boundary")
+	}
+}
+
 func TestAvailablePeerNumberUsesTheManualTransferSessionFlow(t *testing.T) {
 	peerListener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
