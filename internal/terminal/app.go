@@ -4,12 +4,15 @@ package terminal
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,6 +29,7 @@ const connectTimeout = 4 * time.Second
 type Config struct {
 	ListenAddress string
 	Version       session.Version
+	CorruptDigest bool // Used only by protocol-boundary integration builds.
 }
 
 // App owns one foreground listener and at most one Transfer Session.
@@ -44,14 +48,46 @@ type App struct {
 }
 
 type attempt struct {
-	context  context.Context
-	cancel   context.CancelFunc
-	remote   string
-	answer   chan bool
-	raw      net.Conn
-	secure   *session.Session
-	waiting  bool
-	stopping bool
+	context    context.Context
+	cancel     context.CancelFunc
+	remote     string
+	answer     chan bool
+	raw        net.Conn
+	secure     *session.Session
+	waiting    bool
+	stopping   bool
+	incoming   *incomingOffer
+	outgoing   *outgoingOffer
+	finished   chan struct{}
+	finishOnce sync.Once
+}
+
+type incomingOffer struct {
+	id          string
+	name        string
+	size        int64
+	destination string
+	finalPath   string
+	actions     chan offerAction
+	waiting     bool
+	accepted    bool
+	stagingPath string
+	stagingFile *os.File
+}
+
+type outgoingOffer struct {
+	id       string
+	path     string
+	name     string
+	size     int64
+	modified time.Time
+	decision chan session.Message
+	result   chan session.Message
+}
+
+type offerAction struct {
+	kind        string
+	destination string
 }
 
 // New starts the IPv4 listener. Call Run to print endpoints and accept input.
@@ -80,13 +116,13 @@ func New(config Config, output io.Writer) (*App, error) {
 }
 
 // Run serves incoming Peers and handles commands until quit, end-of-input, or
-// an interrupt. It does not create files or retain state after returning.
+// an interrupt. It does not retain identity, trust, history, or configuration.
 func (a *App) Run(input io.Reader) error {
 	a.line("Transferly wire protocol %s", a.config.Version)
 	for _, endpoint := range advertisedEndpoints(a.listener.Addr()) {
 		a.line("Endpoint: %s", endpoint)
 	}
-	a.line("Commands: connect <IPv4:port>, disconnect, quit")
+	a.printCommands()
 
 	go a.acceptConnections()
 
@@ -133,21 +169,27 @@ func (a *App) handleLine(line string) bool {
 	if line == "" {
 		return false
 	}
-
-	if a.answerPendingConfirmation(line) {
+	if a.answerPendingConfirmation(line) || a.answerPendingOffer(line) {
 		return false
 	}
 
-	fields := strings.Fields(line)
-	switch strings.ToLower(fields[0]) {
+	command, argument := splitCommand(line)
+	switch command {
 	case "connect":
-		if len(fields) != 2 {
+		if argument == "" || strings.ContainsAny(argument, " \t") {
 			a.line("Usage: connect <IPv4:port>")
 			return false
 		}
-		a.connect(fields[1])
+		a.connect(argument)
+	case "send":
+		path, ok := onePathArgument(argument)
+		if !ok {
+			a.line("Usage: send <path>")
+			return false
+		}
+		a.sendFile(path)
 	case "disconnect":
-		if len(fields) != 1 {
+		if argument != "" {
 			a.line("Usage: disconnect")
 			return false
 		}
@@ -155,11 +197,36 @@ func (a *App) handleLine(line string) bool {
 	case "quit", "exit":
 		return true
 	case "help":
-		a.line("Commands: connect <IPv4:port>, disconnect, quit")
+		a.printCommands()
+	case "accept", "reject", "destination":
+		a.line("There is no Transfer Offer awaiting approval.")
 	default:
-		a.line("Unknown command %q. Type help for available commands.", fields[0])
+		a.line("Unknown command %q. Type help for available commands.", command)
 	}
 	return false
+}
+
+func splitCommand(line string) (string, string) {
+	for index, character := range line {
+		if character == ' ' || character == '\t' {
+			return strings.ToLower(line[:index]), strings.TrimSpace(line[index+1:])
+		}
+	}
+	return strings.ToLower(line), ""
+}
+
+func onePathArgument(argument string) (string, bool) {
+	argument = strings.TrimSpace(argument)
+	if len(argument) >= 2 && argument[0] == '"' && argument[len(argument)-1] == '"' {
+		argument = argument[1 : len(argument)-1]
+	} else if strings.ContainsAny(argument, "\"\r\n") {
+		return "", false
+	}
+	return argument, argument != ""
+}
+
+func (a *App) printCommands() {
+	a.line("Commands: connect <IPv4:port>, send <path>, disconnect, quit")
 }
 
 func (a *App) answerPendingConfirmation(line string) bool {
@@ -192,6 +259,53 @@ func (a *App) answerPendingConfirmation(line string) bool {
 	return true
 }
 
+func (a *App) answerPendingOffer(line string) bool {
+	a.mu.Lock()
+	current := a.current
+	if current == nil || current.incoming == nil || !current.incoming.waiting {
+		a.mu.Unlock()
+		return false
+	}
+	incoming := current.incoming
+	a.mu.Unlock()
+
+	command, argument := splitCommand(line)
+	action := offerAction{}
+	switch command {
+	case "accept":
+		if argument != "" {
+			a.line("Usage: accept")
+			return true
+		}
+		action.kind = "accept"
+	case "reject":
+		if argument != "" {
+			a.line("Usage: reject")
+			return true
+		}
+		action.kind = "reject"
+	case "destination":
+		path, ok := onePathArgument(argument)
+		if !ok {
+			a.line("Usage: destination <path>")
+			return true
+		}
+		action.kind = "destination"
+		action.destination = path
+	case "disconnect", "quit", "exit":
+		return false
+	default:
+		a.line("Choose accept, reject, or destination <path> for this Transfer Offer.")
+		return true
+	}
+
+	select {
+	case incoming.actions <- action:
+	case <-current.context.Done():
+	}
+	return true
+}
+
 func (a *App) connect(endpoint string) {
 	if err := validatePeerEndpoint(endpoint); err != nil {
 		a.line("Invalid endpoint %q: %v", endpoint, err)
@@ -205,6 +319,7 @@ func (a *App) connect(endpoint string) {
 
 	a.line("Connecting to %s...", endpoint)
 	go func() {
+		defer current.finishOnce.Do(func() { close(current.finished) })
 		dialer := net.Dialer{Timeout: connectTimeout}
 		connection, err := dialer.DialContext(current.context, "tcp4", endpoint)
 		if err != nil {
@@ -252,10 +367,11 @@ func (a *App) beginAttempt(remote string) (*attempt, bool) {
 	}
 	attemptContext, cancel := context.WithCancel(a.rootContext)
 	current := &attempt{
-		context: attemptContext,
-		cancel:  cancel,
-		remote:  remote,
-		answer:  make(chan bool, 1),
+		context:  attemptContext,
+		cancel:   cancel,
+		remote:   remote,
+		answer:   make(chan bool, 1),
+		finished: make(chan struct{}),
 	}
 	a.current = current
 	return current, true
@@ -272,6 +388,7 @@ func (a *App) attachConnection(current *attempt, connection net.Conn) bool {
 }
 
 func (a *App) establish(current *attempt, connection net.Conn, role session.Role) {
+	defer current.finishOnce.Do(func() { close(current.finished) })
 	established := false
 	defer func() {
 		if !established {
@@ -319,7 +436,8 @@ func (a *App) establish(current *attempt, connection net.Conn, role session.Role
 	a.mu.Unlock()
 	a.line("Transfer Session verified with %s.", current.remote)
 
-	waitError := secured.Wait()
+	waitError := a.serveSession(current)
+	a.cleanupIncoming(current)
 	a.mu.Lock()
 	wasCurrent := a.current == current
 	if wasCurrent {
@@ -334,6 +452,497 @@ func (a *App) establish(current *attempt, connection net.Conn, role session.Role
 		} else {
 			a.line("Transfer Session ended.")
 		}
+	}
+}
+
+func (a *App) serveSession(current *attempt) error {
+	for {
+		message, err := current.secure.Receive()
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
+				return nil
+			}
+			return err
+		}
+		switch message.Type {
+		case "offer":
+			if err := a.handleIncomingOffer(current, message); err != nil {
+				return err
+			}
+		case "decision":
+			if !a.routeOutgoing(current, message, true) {
+				return errors.New("received a decision for an unknown Transfer Offer")
+			}
+		case "content":
+			if err := a.receiveContent(current, message); err != nil {
+				return err
+			}
+		case "result":
+			if !a.routeOutgoing(current, message, false) {
+				return errors.New("received a result for an unknown Transfer Offer")
+			}
+		case "abort":
+			a.abortIncoming(current, message)
+		default:
+			return fmt.Errorf("unexpected frame %q while session is active", message.Type)
+		}
+	}
+}
+
+func (a *App) routeOutgoing(current *attempt, message session.Message, decision bool) bool {
+	a.mu.Lock()
+	outgoing := current.outgoing
+	if outgoing == nil || outgoing.id != message.OfferID {
+		a.mu.Unlock()
+		return false
+	}
+	channel := outgoing.result
+	if decision {
+		channel = outgoing.decision
+	}
+	a.mu.Unlock()
+	select {
+	case channel <- message:
+		return true
+	case <-current.context.Done():
+		return false
+	}
+}
+
+func (a *App) sendFile(path string) {
+	a.mu.Lock()
+	current := a.current
+	if current == nil || current.secure == nil {
+		a.mu.Unlock()
+		a.line("Open and verify a Transfer Session before using send.")
+		return
+	}
+	if current.incoming != nil || current.outgoing != nil {
+		a.mu.Unlock()
+		a.line("A Transfer Offer is already active; finish it before sending another file.")
+		return
+	}
+	a.mu.Unlock()
+
+	absolutePath, err := filepath.Abs(path)
+	if err != nil {
+		a.line("Cannot offer %q: %v", path, err)
+		return
+	}
+	info, err := os.Lstat(absolutePath)
+	if err != nil {
+		a.line("Cannot offer %q: %v", path, err)
+		return
+	}
+	if !info.Mode().IsRegular() {
+		a.line("Cannot offer %q: only one readable regular file is supported.", path)
+		return
+	}
+	probe, err := os.Open(absolutePath)
+	if err != nil {
+		a.line("Cannot offer %q: file is not readable: %v", path, err)
+		return
+	}
+	_ = probe.Close()
+	id, err := newOfferID()
+	if err != nil {
+		a.line("Cannot create Transfer Offer: %v", err)
+		return
+	}
+	outgoing := &outgoingOffer{
+		id:       id,
+		path:     absolutePath,
+		name:     info.Name(),
+		size:     info.Size(),
+		modified: info.ModTime(),
+		decision: make(chan session.Message, 1),
+		result:   make(chan session.Message, 1),
+	}
+
+	a.mu.Lock()
+	if a.current != current || current.secure == nil || current.incoming != nil || current.outgoing != nil {
+		a.mu.Unlock()
+		a.line("The Transfer Session changed before the offer could be sent; try again.")
+		return
+	}
+	current.outgoing = outgoing
+	a.mu.Unlock()
+	go a.runOutgoing(current, outgoing)
+}
+
+func (a *App) runOutgoing(current *attempt, outgoing *outgoingOffer) {
+	if err := current.secure.Send(session.Message{Type: "offer", OfferID: outgoing.id, Name: outgoing.name, Size: outgoing.size}); err != nil {
+		a.failOutgoing(current, outgoing, "Could not send Transfer Offer: %v", err)
+		return
+	}
+	a.line("Transfer Offer sent: %s (%d bytes). Waiting for the Peer.", outgoing.name, outgoing.size)
+
+	var decision session.Message
+	select {
+	case decision = <-outgoing.decision:
+	case <-current.context.Done():
+		return
+	}
+	if decision.Accepted == nil {
+		a.failOutgoing(current, outgoing, "Peer sent an invalid Transfer Offer decision.")
+		return
+	}
+	if !*decision.Accepted {
+		a.clearOutgoing(current, outgoing)
+		a.line("Peer rejected Transfer Offer %s. No file content was sent.", outgoing.name)
+		return
+	}
+
+	source, err := os.Open(outgoing.path)
+	if err != nil {
+		_ = current.secure.Send(session.Message{Type: "abort", OfferID: outgoing.id, Reason: "source could not be opened"})
+		a.failOutgoing(current, outgoing, "Transfer failed for %s: source could not be opened: %v", outgoing.name, err)
+		return
+	}
+	before, err := source.Stat()
+	if err != nil || before.Size() != outgoing.size || !before.ModTime().Equal(outgoing.modified) {
+		_ = source.Close()
+		_ = current.secure.Send(session.Message{Type: "abort", OfferID: outgoing.id, Reason: "source changed after approval"})
+		a.failOutgoing(current, outgoing, "Transfer failed for %s: source changed after the offer was created.", outgoing.name)
+		return
+	}
+
+	progress := a.progress("Sending "+outgoing.name, outgoing.size)
+	digest, streamError := current.secure.SendStream(current.context, session.Message{
+		Type: "content", OfferID: outgoing.id, Size: outgoing.size,
+	}, source, outgoing.size, progress)
+	after, statError := source.Stat()
+	closeError := source.Close()
+	if streamError != nil || statError != nil || closeError != nil || after.Size() != outgoing.size || !after.ModTime().Equal(outgoing.modified) {
+		a.failOutgoing(current, outgoing, "Transfer failed for %s because the source changed or could not be read completely.", outgoing.name)
+		_ = current.secure.Close()
+		return
+	}
+	if a.config.CorruptDigest {
+		digest = corruptSHA256(digest)
+	}
+	if err := current.secure.Send(session.Message{Type: "complete", OfferID: outgoing.id, Size: outgoing.size, Digest: digest}); err != nil {
+		a.failOutgoing(current, outgoing, "Transfer failed for %s while sending its integrity result: %v", outgoing.name, err)
+		return
+	}
+
+	var result session.Message
+	select {
+	case result = <-outgoing.result:
+	case <-current.context.Done():
+		return
+	}
+	a.clearOutgoing(current, outgoing)
+	if result.Success == nil || !*result.Success {
+		reason := result.Reason
+		if reason == "" {
+			reason = "the Peer could not verify or publish it"
+		}
+		a.line("Transfer failed for %s: %s.", outgoing.name, reason)
+		return
+	}
+	a.line("Transfer complete: %s (%d bytes).", outgoing.name, outgoing.size)
+}
+
+func (a *App) failOutgoing(current *attempt, outgoing *outgoingOffer, format string, arguments ...any) {
+	a.clearOutgoing(current, outgoing)
+	a.line(format, arguments...)
+}
+
+func (a *App) clearOutgoing(current *attempt, outgoing *outgoingOffer) {
+	a.mu.Lock()
+	if current.outgoing == outgoing {
+		current.outgoing = nil
+	}
+	a.mu.Unlock()
+}
+
+func (a *App) handleIncomingOffer(current *attempt, message session.Message) error {
+	if message.OfferID == "" || message.Size < 0 || !safeFileName(message.Name) {
+		return errors.New("Peer sent an invalid Transfer Offer")
+	}
+	destination, err := defaultDestination()
+	if err != nil {
+		return fmt.Errorf("resolve Downloads destination: %w", err)
+	}
+	finalPath, err := resolveFinalPath(destination, message.Name)
+	if err != nil {
+		return fmt.Errorf("resolve offered destination: %w", err)
+	}
+	incoming := &incomingOffer{
+		id:          message.OfferID,
+		name:        message.Name,
+		size:        message.Size,
+		destination: destination,
+		finalPath:   finalPath,
+		actions:     make(chan offerAction, 1),
+		waiting:     true,
+	}
+
+	a.mu.Lock()
+	if current.incoming != nil || current.outgoing != nil {
+		a.mu.Unlock()
+		accepted := false
+		return current.secure.Send(session.Message{Type: "decision", OfferID: message.OfferID, Accepted: &accepted, Reason: "another Transfer Offer is active"})
+	}
+	current.incoming = incoming
+	a.mu.Unlock()
+	a.showIncoming(incoming)
+
+	for {
+		select {
+		case action := <-incoming.actions:
+			switch action.kind {
+			case "destination":
+				destination, absoluteError := filepath.Abs(action.destination)
+				if absoluteError != nil {
+					a.line("Cannot use destination %q: %v", action.destination, absoluteError)
+					continue
+				}
+				finalPath, resolveError := resolveFinalPath(destination, incoming.name)
+				if resolveError != nil {
+					a.line("Cannot use destination %q: %v", action.destination, resolveError)
+					continue
+				}
+				incoming.destination = filepath.Clean(destination)
+				incoming.finalPath = finalPath
+				a.line("Destination updated for this Transfer Offer only.")
+				a.showIncoming(incoming)
+			case "reject":
+				a.mu.Lock()
+				incoming.waiting = false
+				a.mu.Unlock()
+				accepted := false
+				if err := current.secure.Send(session.Message{Type: "decision", OfferID: incoming.id, Accepted: &accepted}); err != nil {
+					return err
+				}
+				a.clearIncoming(current, incoming)
+				a.line("Transfer Offer rejected. No file content was written.")
+				return nil
+			case "accept":
+				if err := prepareIncoming(incoming); err != nil {
+					a.line("Cannot accept Transfer Offer at %s: %v", incoming.destination, err)
+					continue
+				}
+				a.mu.Lock()
+				incoming.waiting = false
+				incoming.accepted = true
+				a.mu.Unlock()
+				accepted := true
+				if err := current.secure.Send(session.Message{Type: "decision", OfferID: incoming.id, Accepted: &accepted}); err != nil {
+					a.cleanupIncoming(current)
+					return err
+				}
+				a.line("Transfer Offer accepted. Waiting for file content.")
+				return nil
+			}
+		case <-current.context.Done():
+			return current.context.Err()
+		}
+	}
+}
+
+func (a *App) showIncoming(incoming *incomingOffer) {
+	a.line("Transfer Offer: %s (%d bytes)", incoming.name, incoming.size)
+	a.line("Destination: %s", incoming.destination)
+	a.line("Final path: %s", incoming.finalPath)
+	a.line("Choose accept, reject, or destination <path>.")
+}
+
+func prepareIncoming(incoming *incomingOffer) error {
+	if err := os.MkdirAll(incoming.destination, 0o755); err != nil {
+		return err
+	}
+	stagingDirectory := filepath.Join(incoming.destination, ".transferly-staging")
+	if err := os.MkdirAll(stagingDirectory, 0o700); err != nil {
+		return err
+	}
+	file, err := os.CreateTemp(stagingDirectory, "incoming-*.part")
+	if err != nil {
+		return err
+	}
+	incoming.stagingPath = file.Name()
+	incoming.stagingFile = file
+	return nil
+}
+
+func (a *App) receiveContent(current *attempt, message session.Message) error {
+	a.mu.Lock()
+	incoming := current.incoming
+	a.mu.Unlock()
+	if incoming == nil || !incoming.accepted || incoming.id != message.OfferID || incoming.size != message.Size || incoming.stagingFile == nil {
+		return errors.New("Peer sent file content without an accepted matching Transfer Offer")
+	}
+
+	progress := a.progress("Receiving "+incoming.name, incoming.size)
+	digest, err := current.secure.ReceiveStream(current.context, incoming.stagingFile, incoming.size, progress)
+	if err != nil {
+		a.cleanupIncoming(current)
+		return fmt.Errorf("receive %s: %w", incoming.name, err)
+	}
+	if err := incoming.stagingFile.Sync(); err != nil {
+		a.cleanupIncoming(current)
+		return fmt.Errorf("flush temporary file: %w", err)
+	}
+	if err := incoming.stagingFile.Close(); err != nil {
+		incoming.stagingFile = nil
+		a.cleanupIncoming(current)
+		return fmt.Errorf("close temporary file: %w", err)
+	}
+	incoming.stagingFile = nil
+
+	completion, err := current.secure.Receive()
+	if err != nil {
+		a.cleanupIncoming(current)
+		return err
+	}
+	if completion.Type != "complete" || completion.OfferID != incoming.id || completion.Size != incoming.size {
+		a.cleanupIncoming(current)
+		return errors.New("Peer sent an invalid file completion frame")
+	}
+	if len(completion.Digest) != 64 || !strings.EqualFold(completion.Digest, digest) {
+		a.removeIncomingFiles(incoming)
+		success := false
+		_ = current.secure.Send(session.Message{Type: "result", OfferID: incoming.id, Success: &success, Reason: "size or SHA-256 integrity check failed"})
+		a.clearIncoming(current, incoming)
+		a.line("Transfer failed for %s: size or SHA-256 integrity check failed; incomplete content was removed.", incoming.name)
+		return nil
+	}
+	if err := publishWithoutOverwrite(incoming.stagingPath, incoming.finalPath); err != nil {
+		a.removeIncomingFiles(incoming)
+		success := false
+		_ = current.secure.Send(session.Message{Type: "result", OfferID: incoming.id, Success: &success, Reason: "final path became unavailable"})
+		a.clearIncoming(current, incoming)
+		a.line("Transfer failed for %s: final path became unavailable; existing content was not overwritten.", incoming.name)
+		return nil
+	}
+	incoming.stagingPath = ""
+	removeEmptyStagingDirectory(incoming.destination)
+	success := true
+	if err := current.secure.Send(session.Message{Type: "result", OfferID: incoming.id, Success: &success}); err != nil {
+		a.clearIncoming(current, incoming)
+		return err
+	}
+	a.clearIncoming(current, incoming)
+	a.line("Received %s (%d bytes) at %s.", incoming.name, incoming.size, incoming.finalPath)
+	return nil
+}
+
+func (a *App) abortIncoming(current *attempt, message session.Message) {
+	a.mu.Lock()
+	incoming := current.incoming
+	a.mu.Unlock()
+	if incoming == nil || incoming.id != message.OfferID {
+		return
+	}
+	a.removeIncomingFiles(incoming)
+	a.clearIncoming(current, incoming)
+	reason := message.Reason
+	if reason == "" {
+		reason = "the sender stopped the transfer"
+	}
+	a.line("Transfer failed for %s: %s; incomplete content was removed.", incoming.name, reason)
+}
+
+func (a *App) clearIncoming(current *attempt, incoming *incomingOffer) {
+	a.mu.Lock()
+	if current.incoming == incoming {
+		current.incoming = nil
+	}
+	a.mu.Unlock()
+}
+
+func (a *App) cleanupIncoming(current *attempt) {
+	a.mu.Lock()
+	incoming := current.incoming
+	current.incoming = nil
+	a.mu.Unlock()
+	if incoming != nil {
+		a.removeIncomingFiles(incoming)
+	}
+}
+
+func (a *App) removeIncomingFiles(incoming *incomingOffer) {
+	if incoming.stagingFile != nil {
+		_ = incoming.stagingFile.Close()
+		incoming.stagingFile = nil
+	}
+	if incoming.stagingPath != "" {
+		_ = os.Remove(incoming.stagingPath)
+		incoming.stagingPath = ""
+	}
+	removeEmptyStagingDirectory(incoming.destination)
+}
+
+func removeEmptyStagingDirectory(destination string) {
+	_ = os.Remove(filepath.Join(destination, ".transferly-staging"))
+}
+
+func defaultDestination() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "Downloads"), nil
+}
+
+func resolveFinalPath(destination, name string) (string, error) {
+	if !safeFileName(name) {
+		return "", errors.New("file name is not safe")
+	}
+	destination, err := filepath.Abs(destination)
+	if err != nil {
+		return "", err
+	}
+	entries, err := os.ReadDir(destination)
+	if err != nil && !os.IsNotExist(err) {
+		return "", err
+	}
+	existing := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		existing[strings.ToLower(entry.Name())] = struct{}{}
+	}
+	candidate := name
+	extension := filepath.Ext(name)
+	stem := strings.TrimSuffix(name, extension)
+	for suffix := 1; ; suffix++ {
+		if _, found := existing[strings.ToLower(candidate)]; !found {
+			return filepath.Join(destination, candidate), nil
+		}
+		candidate = fmt.Sprintf("%s (%d)%s", stem, suffix, extension)
+	}
+}
+
+func safeFileName(name string) bool {
+	return name != "" && name != "." && name != ".." && filepath.Base(name) == name && !strings.ContainsAny(name, "/\\\x00\r\n")
+}
+
+func newOfferID() (string, error) {
+	identifier := make([]byte, 16)
+	if _, err := rand.Read(identifier); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(identifier), nil
+}
+
+func corruptSHA256(digest string) string {
+	if digest == "" {
+		return digest
+	}
+	if digest[0] == '0' {
+		return "1" + digest[1:]
+	}
+	return "0" + digest[1:]
+}
+
+func (a *App) progress(label string, total int64) session.Progress {
+	lastReported := int64(-1)
+	return func(completed int64) {
+		if completed != 0 && completed != total && completed-lastReported < 1024*1024 {
+			return
+		}
+		lastReported = completed
+		a.line("%s: %d/%d bytes", label, completed, total)
 	}
 }
 
@@ -411,6 +1020,11 @@ func (a *App) shutdown() {
 			_ = secured.Close()
 		} else if raw != nil {
 			_ = raw.Close()
+		}
+		select {
+		case <-current.finished:
+		case <-time.After(2 * time.Second):
+			a.line("Cleanup is still stopping; destination-local incomplete data may require removal.")
 		}
 	}
 	a.line("Transferly stopped. No identity or trust was saved.")

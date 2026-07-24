@@ -2,6 +2,7 @@ package integration_test
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"os"
@@ -21,6 +22,7 @@ var (
 	projectRoot                      string
 	transferlyExecutable             string
 	incompatibleTransferlyExecutable string
+	corruptDigestExecutable          string
 )
 
 func TestMain(m *testing.M) {
@@ -43,12 +45,17 @@ func TestMain(m *testing.M) {
 	}
 	transferlyExecutable = filepath.Join(tempDir, "transferly"+extension)
 	incompatibleTransferlyExecutable = filepath.Join(tempDir, "transferly-v2"+extension)
+	corruptDigestExecutable = filepath.Join(tempDir, "transferly-corrupt-digest"+extension)
 
 	if err := buildExecutable(transferlyExecutable); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 	if err := buildExecutable(incompatibleTransferlyExecutable, "-ldflags", "-X main.wireMajor=2"); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := buildExecutable(corruptDigestExecutable, "-ldflags", "-X main.corruptDigest=true"); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -77,6 +84,270 @@ func buildExecutable(destination string, extraArguments ...string) error {
 		return fmt.Errorf("build Transferly: %w\n%s", err, output)
 	}
 	return nil
+}
+
+func TestAcceptedFileIsPublishedWithoutChangingTheSource(t *testing.T) {
+	sender := startPeer(t, transferlyExecutable)
+	receiver := startPeer(t, transferlyExecutable)
+	verifyPeers(t, sender, receiver)
+
+	sourceDirectory := t.TempDir()
+	sourcePath := filepath.Join(sourceDirectory, "quarterly-report.txt")
+	original := []byte("Transferly keeps the source unchanged.\n")
+	if err := os.WriteFile(sourcePath, original, 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	sender.send(t, "send "+sourcePath)
+	receiver.waitFor(t, "Transfer Offer: quarterly-report.txt (39 bytes)")
+	destination := filepath.Join(receiver.homeDir, "Downloads", "quarterly-report.txt")
+	receiver.waitFor(t, "Final path: "+destination)
+	if _, err := os.Stat(destination); !os.IsNotExist(err) {
+		t.Fatalf("content was written before approval: %v", err)
+	}
+
+	receiver.send(t, "accept")
+	sender.waitFor(t, "Transfer complete: quarterly-report.txt (39 bytes)")
+	receiver.waitFor(t, "Received quarterly-report.txt (39 bytes)")
+
+	received, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(received) != string(original) {
+		t.Fatalf("received bytes = %q, want %q", received, original)
+	}
+	unchanged, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(unchanged) != string(original) {
+		t.Fatalf("source bytes changed to %q", unchanged)
+	}
+	if _, err := os.Stat(filepath.Join(receiver.homeDir, "Downloads", ".transferly-staging")); !os.IsNotExist(err) {
+		t.Fatalf("temporary storage was retained after publication: %v", err)
+	}
+}
+
+func TestLargeFileStreamsToCompletionWithConstrainedProcessMemory(t *testing.T) {
+	sender := startPeer(t, transferlyExecutable)
+	receiver := startPeer(t, transferlyExecutable)
+	verifyPeers(t, sender, receiver)
+
+	const size = 32 * 1024 * 1024
+	sourcePath := filepath.Join(t.TempDir(), "large.bin")
+	source, err := os.Create(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := make([]byte, 64*1024)
+	for index := range chunk {
+		chunk[index] = byte(index % 251)
+	}
+	for written := 0; written < size; written += len(chunk) {
+		if _, err := source.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	sender.send(t, "send "+sourcePath)
+	receiver.waitFor(t, "Transfer Offer: large.bin (33554432 bytes)")
+	receiver.send(t, "accept")
+	sender.waitFor(t, "Sending large.bin: 33554432/33554432 bytes")
+	receiver.waitFor(t, "Received large.bin (33554432 bytes)")
+
+	destination := filepath.Join(receiver.homeDir, "Downloads", "large.bin")
+	if fileSHA256(t, sourcePath) != fileSHA256(t, destination) {
+		t.Fatal("large streamed destination digest does not match the source")
+	}
+}
+
+func TestDigestMismatchRemovesIncompleteContent(t *testing.T) {
+	sender := startPeer(t, corruptDigestExecutable)
+	receiver := startPeer(t, transferlyExecutable)
+	verifyPeers(t, sender, receiver)
+
+	sourcePath := filepath.Join(t.TempDir(), "tampered.bin")
+	if err := os.WriteFile(sourcePath, []byte("integrity matters"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sender.send(t, "send "+sourcePath)
+	receiver.waitFor(t, "Transfer Offer: tampered.bin (17 bytes)")
+	receiver.send(t, "accept")
+	receiver.waitFor(t, "SHA-256 integrity check failed; incomplete content was removed")
+	sender.waitFor(t, "SHA-256 integrity check failed")
+
+	downloads := filepath.Join(receiver.homeDir, "Downloads")
+	if _, err := os.Stat(filepath.Join(downloads, "tampered.bin")); !os.IsNotExist(err) {
+		t.Fatalf("mismatched content was published: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(downloads, ".transferly-staging")); !os.IsNotExist(err) {
+		t.Fatalf("mismatched temporary content was retained: %v", err)
+	}
+
+	offersBefore := receiver.count("Transfer Offer: tampered.bin")
+	sender.send(t, "send "+sourcePath)
+	receiver.waitForCount(t, "Transfer Offer: tampered.bin", offersBefore+1)
+	receiver.send(t, "reject")
+}
+
+func TestInvalidMissingAndUnsupportedSourcesDoNotEndTheSession(t *testing.T) {
+	sender := startPeer(t, transferlyExecutable)
+	receiver := startPeer(t, transferlyExecutable)
+	verifyPeers(t, sender, receiver)
+
+	sender.send(t, "send")
+	sender.waitFor(t, "Usage: send <path>")
+	missing := filepath.Join(t.TempDir(), "missing.txt")
+	sender.send(t, "send "+missing)
+	sender.waitFor(t, "Cannot offer")
+	folder := t.TempDir()
+	sender.send(t, "send "+folder)
+	sender.waitFor(t, "only one readable regular file is supported")
+
+	target := filepath.Join(t.TempDir(), "target.txt")
+	if err := os.WriteFile(target, []byte("target"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "linked.txt")
+	if err := os.Symlink(target, link); err == nil {
+		unsupportedBefore := sender.count("only one readable regular file is supported")
+		sender.send(t, "send "+link)
+		sender.waitForCount(t, "only one readable regular file is supported", unsupportedBefore+1)
+	}
+
+	valid := filepath.Join(t.TempDir(), "valid.txt")
+	if err := os.WriteFile(valid, []byte("still connected"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sender.send(t, "send "+valid)
+	receiver.waitFor(t, "Transfer Offer: valid.txt (15 bytes)")
+	receiver.send(t, "reject")
+	sender.waitFor(t, "Peer rejected Transfer Offer valid.txt")
+}
+
+func TestZeroByteFileIsIntegrityCheckedAndPublished(t *testing.T) {
+	sender := startPeer(t, transferlyExecutable)
+	receiver := startPeer(t, transferlyExecutable)
+	verifyPeers(t, sender, receiver)
+
+	sourcePath := filepath.Join(t.TempDir(), "empty.dat")
+	if err := os.WriteFile(sourcePath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sender.send(t, "send "+sourcePath)
+	receiver.waitFor(t, "Transfer Offer: empty.dat (0 bytes)")
+	receiver.send(t, "accept")
+	sender.waitFor(t, "Sending empty.dat: 0/0 bytes")
+	receiver.waitFor(t, "Receiving empty.dat: 0/0 bytes")
+	receiver.waitFor(t, "Received empty.dat (0 bytes)")
+
+	destination := filepath.Join(receiver.homeDir, "Downloads", "empty.dat")
+	info, err := os.Stat(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("zero-byte destination has size %d", info.Size())
+	}
+}
+
+func TestExistingDestinationIsNotOverwrittenAndConflictNameIsPreviewed(t *testing.T) {
+	sender := startPeer(t, transferlyExecutable)
+	receiver := startPeer(t, transferlyExecutable)
+	verifyPeers(t, sender, receiver)
+
+	sourcePath := filepath.Join(t.TempDir(), "notes.txt")
+	if err := os.WriteFile(sourcePath, []byte("new notes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	downloads := filepath.Join(receiver.homeDir, "Downloads")
+	if err := os.MkdirAll(downloads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	existingPath := filepath.Join(downloads, "notes.txt")
+	if err := os.WriteFile(existingPath, []byte("existing notes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sender.send(t, "send "+sourcePath)
+	generatedPath := filepath.Join(downloads, "notes (1).txt")
+	receiver.waitFor(t, "Final path: "+generatedPath)
+	receiver.send(t, "accept")
+	receiver.waitFor(t, "Received notes.txt (9 bytes)")
+
+	existing, err := os.ReadFile(existingPath)
+	if err != nil || string(existing) != "existing notes" {
+		t.Fatalf("existing destination changed: bytes=%q err=%v", existing, err)
+	}
+	generated, err := os.ReadFile(generatedPath)
+	if err != nil || string(generated) != "new notes" {
+		t.Fatalf("generated destination: bytes=%q err=%v", generated, err)
+	}
+}
+
+func TestReceiverOverridesDestinationForOneOffer(t *testing.T) {
+	sender := startPeer(t, transferlyExecutable)
+	receiver := startPeer(t, transferlyExecutable)
+	verifyPeers(t, sender, receiver)
+
+	sourcePath := filepath.Join(t.TempDir(), "photo.jpg")
+	if err := os.WriteFile(sourcePath, []byte("image bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	customDestination := filepath.Join(receiver.workDir, "Chosen Folder")
+	sender.send(t, "send "+sourcePath)
+	receiver.waitFor(t, "Transfer Offer: photo.jpg (11 bytes)")
+	receiver.send(t, `destination "`+customDestination+`"`)
+	receiver.waitFor(t, "Destination updated for this Transfer Offer only.")
+	customPath := filepath.Join(customDestination, "photo.jpg")
+	receiver.waitFor(t, "Final path: "+customPath)
+	receiver.send(t, "accept")
+	receiver.waitFor(t, "Received photo.jpg (11 bytes)")
+	sender.waitFor(t, "Transfer complete: photo.jpg (11 bytes)")
+
+	if _, err := os.Stat(customPath); err != nil {
+		t.Fatalf("custom destination was not published: %v", err)
+	}
+	defaultPath := filepath.Join(receiver.homeDir, "Downloads", "photo.jpg")
+	if _, err := os.Stat(defaultPath); !os.IsNotExist(err) {
+		t.Fatalf("offer unexpectedly used the default destination: %v", err)
+	}
+
+	defaultPreview := "Destination: " + filepath.Join(receiver.homeDir, "Downloads")
+	previewsBefore := receiver.count(defaultPreview)
+	sender.send(t, "send "+sourcePath)
+	receiver.waitForCount(t, defaultPreview, previewsBefore+1)
+	receiver.send(t, "reject")
+}
+
+func TestRejectedFileWritesNothingAndLeavesTheSessionActive(t *testing.T) {
+	sender := startPeer(t, transferlyExecutable)
+	receiver := startPeer(t, transferlyExecutable)
+	verifyPeers(t, sender, receiver)
+
+	sourcePath := filepath.Join(t.TempDir(), "private.txt")
+	if err := os.WriteFile(sourcePath, []byte("not approved"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sender.send(t, "send "+sourcePath)
+	receiver.waitFor(t, "Transfer Offer: private.txt (12 bytes)")
+	receiver.send(t, "reject")
+	receiver.waitFor(t, "Transfer Offer rejected. No file content was written.")
+	sender.waitFor(t, "Peer rejected Transfer Offer private.txt. No file content was sent.")
+
+	destination := filepath.Join(receiver.homeDir, "Downloads", "private.txt")
+	if _, err := os.Stat(destination); !os.IsNotExist(err) {
+		t.Fatalf("rejected content exists at %s: %v", destination, err)
+	}
+
+	offersBefore := receiver.count("Transfer Offer: private.txt")
+	sender.send(t, "send "+sourcePath)
+	receiver.waitForCount(t, "Transfer Offer: private.txt", offersBefore+1)
+	receiver.send(t, "reject")
 }
 
 func TestPeersVerifyDisconnectAndVerifyAgain(t *testing.T) {
@@ -183,6 +454,7 @@ type peerProcess struct {
 	stdin    io.WriteCloser
 	endpoint string
 	workDir  string
+	homeDir  string
 
 	mu     sync.Mutex
 	output strings.Builder
@@ -192,8 +464,10 @@ type peerProcess struct {
 func startPeer(t *testing.T, executable string) *peerProcess {
 	t.Helper()
 	workDir := t.TempDir()
+	homeDir := t.TempDir()
 	command := exec.Command(executable, "--listen", "127.0.0.1:0")
 	command.Dir = workDir
+	command.Env = append(os.Environ(), "HOME="+homeDir, "USERPROFILE="+homeDir, "GOMEMLIMIT=24MiB")
 	stdin, err := command.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -204,7 +478,7 @@ func startPeer(t *testing.T, executable string) *peerProcess {
 	}
 	command.Stderr = command.Stdout
 
-	peer := &peerProcess{command: command, stdin: stdin, workDir: workDir, change: make(chan struct{}, 1)}
+	peer := &peerProcess{command: command, stdin: stdin, workDir: workDir, homeDir: homeDir, change: make(chan struct{}, 1)}
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -218,6 +492,22 @@ func startPeer(t *testing.T, executable string) *peerProcess {
 	}
 	peer.endpoint = match[1]
 	return peer
+}
+
+func fileSHA256(t *testing.T, path string) [sha256.Size]byte {
+	t.Helper()
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		t.Fatal(err)
+	}
+	var digest [sha256.Size]byte
+	copy(digest[:], hash.Sum(nil))
+	return digest
 }
 
 func (p *peerProcess) collect(reader io.Reader) {

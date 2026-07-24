@@ -12,7 +12,10 @@ import (
 
 // wireMajor is a string so release builds can set it with -ldflags -X while
 // keeping wire-protocol versioning independent from the executable version.
-var wireMajor = "1"
+var (
+	wireMajor     = "1"
+	corruptDigest = "false" // Overridden only by protocol-boundary integration builds.
+)
 
 func main() {
 	listenAddress := flag.String("listen", "0.0.0.0:0", "numeric IPv4 address and port to listen on (port 0 selects an available port)")
@@ -27,9 +30,15 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Transferly was built with an invalid wire protocol version.")
 		os.Exit(1)
 	}
+	corrupt, err := strconv.ParseBool(corruptDigest)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Transferly was built with an invalid integration fault setting.")
+		os.Exit(1)
+	}
 	application, err := terminal.New(terminal.Config{
 		ListenAddress: *listenAddress,
 		Version:       session.Version{Major: major, Minor: 0},
+		CorruptDigest: corrupt,
 	}, os.Stdout)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Could not start Transferly: %v\n", err)

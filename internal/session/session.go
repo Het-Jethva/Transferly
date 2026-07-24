@@ -11,12 +11,14 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math/big"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -68,7 +70,25 @@ func (e *VersionError) Error() string {
 type Session struct {
 	connection *tls.Conn
 	reader     *bufio.Reader
+	writeMu    sync.Mutex
 }
+
+// Message is a bounded control frame exchanged only after a Transfer Session
+// has been verified. File bytes are streamed separately by SendStream and
+// ReceiveStream so their size is not limited by control-frame bounds.
+type Message struct {
+	Type     string `json:"type"`
+	OfferID  string `json:"offer_id,omitempty"`
+	Name     string `json:"name,omitempty"`
+	Size     int64  `json:"size,omitempty"`
+	Accepted *bool  `json:"accepted,omitempty"`
+	Digest   string `json:"digest,omitempty"`
+	Success  *bool  `json:"success,omitempty"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+// Progress observes the number of file bytes copied through a stream.
+type Progress func(completed int64)
 
 // Open protects raw with mutually authenticated TLS 1.3, negotiates the wire
 // protocol, and waits for both human confirmations. Credentials exist only in
@@ -113,7 +133,7 @@ func Open(ctx context.Context, raw net.Conn, role Role, version Version, confirm
 	if err := writeFrame(protected, wireMessage{Type: "hello", Version: version}); err != nil {
 		return nil, fmt.Errorf("send protocol version: %w", err)
 	}
-	peerHello, err := readFrame(reader)
+	peerHello, err := readWireFrame(reader)
 	if err != nil {
 		return nil, fmt.Errorf("read protocol version: %w", err)
 	}
@@ -136,17 +156,89 @@ func Open(ctx context.Context, raw net.Conn, role Role, version Version, confirm
 	return &Session{connection: protected, reader: reader}, nil
 }
 
-// Wait blocks until the Peer closes the Transfer Session. Transfer Offer
-// frames will be added at this verified seam in later work.
-func (s *Session) Wait() error {
-	message, err := readFrame(s.reader)
-	if err != nil {
-		if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
-			return nil
-		}
-		return err
+// Send writes one bounded control message to the verified Peer.
+func (s *Session) Send(message Message) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return writeFrame(s.connection, message)
+}
+
+// Receive reads one bounded control message from the verified Peer.
+func (s *Session) Receive() (Message, error) {
+	var message Message
+	err := readJSONFrame(s.reader, &message)
+	return message, err
+}
+
+// SendStream writes a content header followed by exactly size bytes while
+// computing SHA-256 with a fixed-size buffer.
+func (s *Session) SendStream(ctx context.Context, header Message, source io.Reader, size int64, progress Progress) (string, error) {
+	if size < 0 {
+		return "", errors.New("stream size cannot be negative")
 	}
-	return fmt.Errorf("unexpected frame %q while session is idle", message.Type)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := writeFrame(s.connection, header); err != nil {
+		return "", err
+	}
+	hash := sha256.New()
+	if err := copyStream(ctx, io.MultiWriter(s.connection, hash), source, size, progress); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// ReceiveStream reads exactly size bytes from the current content frame into
+// destination while independently computing SHA-256 with bounded memory.
+func (s *Session) ReceiveStream(ctx context.Context, destination io.Writer, size int64, progress Progress) (string, error) {
+	if size < 0 {
+		return "", errors.New("stream size cannot be negative")
+	}
+	hash := sha256.New()
+	if err := copyStream(ctx, io.MultiWriter(destination, hash), s.reader, size, progress); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func copyStream(ctx context.Context, destination io.Writer, source io.Reader, size int64, progress Progress) error {
+	const bufferBytes = 64 * 1024
+	buffer := make([]byte, bufferBytes)
+	remaining := size
+	completed := int64(0)
+	if progress != nil {
+		progress(0)
+	}
+	for remaining > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		chunk := int64(len(buffer))
+		if remaining < chunk {
+			chunk = remaining
+		}
+		read, readError := io.ReadFull(source, buffer[:chunk])
+		if read > 0 {
+			written, writeError := destination.Write(buffer[:read])
+			if writeError != nil {
+				return writeError
+			}
+			if written != read {
+				return io.ErrShortWrite
+			}
+			completed += int64(read)
+			remaining -= int64(read)
+			if progress != nil {
+				progress(completed)
+			}
+		}
+		if readError != nil {
+			return readError
+		}
+	}
+	return nil
 }
 
 // Close ends the temporary trust relationship and removes all in-memory TLS
@@ -172,7 +264,7 @@ func exchangeConfirmation(ctx context.Context, connection net.Conn, reader *bufi
 
 	peerResult := make(chan confirmationResult, 1)
 	go func() {
-		message, err := readFrame(reader)
+		message, err := readWireFrame(reader)
 		if err != nil {
 			peerResult <- confirmationResult{err: fmt.Errorf("read Peer confirmation: %w", err)}
 			return
@@ -226,7 +318,7 @@ func confirmationMessage(accepted bool) wireMessage {
 	return wireMessage{Type: "confirmation", Accepted: &accepted}
 }
 
-func writeFrame(writer io.Writer, message wireMessage) error {
+func writeFrame(writer io.Writer, message any) error {
 	encoded, err := json.Marshal(message)
 	if err != nil {
 		return err
@@ -248,19 +340,24 @@ func writeFrame(writer io.Writer, message wireMessage) error {
 	return nil
 }
 
-func readFrame(reader *bufio.Reader) (wireMessage, error) {
+func readWireFrame(reader *bufio.Reader) (wireMessage, error) {
 	var message wireMessage
+	err := readJSONFrame(reader, &message)
+	return message, err
+}
+
+func readJSONFrame(reader *bufio.Reader, destination any) error {
 	line, err := reader.ReadSlice('\n')
 	if errors.Is(err, bufio.ErrBufferFull) || len(line) > maximumFrameBytes {
-		return message, errors.New("protocol frame exceeds maximum size")
+		return errors.New("protocol frame exceeds maximum size")
 	}
 	if err != nil {
-		return message, err
+		return err
 	}
-	if err := json.Unmarshal(line, &message); err != nil {
-		return message, fmt.Errorf("invalid protocol frame: %w", err)
+	if err := json.Unmarshal(line, destination); err != nil {
+		return fmt.Errorf("invalid protocol frame: %w", err)
 	}
-	return message, nil
+	return nil
 }
 
 func verificationCode(state tls.ConnectionState) (string, error) {

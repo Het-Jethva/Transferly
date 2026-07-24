@@ -1,6 +1,6 @@
 # Transferly
 
-Transferly is a foreground terminal application for direct file exchange between reachable Peers. This bootstrap implements temporary, human-verified Transfer Sessions over a manually supplied IPv4 endpoint. Transfer Offers and file copying will be added in later work.
+Transferly is a foreground terminal application for direct file exchange between reachable Peers. It opens temporary, human-verified Transfer Sessions over a manually supplied IPv4 endpoint and can safely copy one approved regular file at a time.
 
 Transferly uses no account, cloud service, relay, configuration file, persistent identity, remembered trust, telemetry, or log file.
 
@@ -34,6 +34,14 @@ connect 192.168.1.20:53144
 ```
 
 Both terminals display a six-digit code. Compare the codes through an in-person or otherwise trusted channel, then type `yes` on both terminals only when they match. Type `no` on either terminal if they do not match.
+
+In a verified Transfer Session, either Peer can offer a readable regular file:
+
+```text
+send C:\path\to\report.pdf
+```
+
+The receiving Peer sees the file name, byte size, Downloads destination, and conflict-resolved final path before choosing `accept` or `reject`. Use `destination <path>` at that prompt to override the destination for that Transfer Offer only. Accepted bytes are streamed into destination-local temporary storage, checked with SHA-256 and a byte count, and atomically published without overwriting an existing file. Rejected or mismatched content is removed, and the source is never modified.
 
 Use `disconnect` to end the temporary Transfer Session and `quit` to exit. Reconnecting always creates fresh in-memory credentials and requires verification again.
 
