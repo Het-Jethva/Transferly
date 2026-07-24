@@ -45,13 +45,15 @@ Computer names and discovery records are untrusted availability hints; they neve
 
 Both terminals display a six-digit code. Compare the codes through an in-person or otherwise trusted channel, then type `yes` on both terminals only when they match. Type `no` on either terminal if they do not match.
 
-In a verified Transfer Session, either Peer can offer readable regular files repeatedly:
+In a verified Transfer Session, either Peer can offer any mix of files and folders repeatedly:
 
 ```text
-send C:\path\to\report.pdf
+send C:\path\to\report.pdf "C:\path\to\Project Folder"
 ```
 
-The receiving Peer sees the file name, byte size, Downloads destination, and conflict-resolved final path before choosing `accept` or `reject`. Use `destination <path>` at that prompt to override the destination for that Transfer Offer only. Accepted bytes are streamed into destination-local temporary storage, checked with SHA-256 and a byte count, and atomically published without overwriting an existing file. Rejected or mismatched content is removed, and the source is never modified.
+Folders are traversed recursively. Readable regular files, hidden files, zero-byte files, nested folders, and empty folders are included. Symbolic links, junctions, reparse points, and unreadable or vanished entries are omitted and disclosed. The receiving Peer sees top-level roots, file/folder counts, total bytes, omissions, the Downloads destination, and conflict-resolved final paths before choosing `accept` or `reject`; `details` prints the complete manifest. Use `destination <path>` to override the destination for that Transfer Offer only.
+
+Accepted files are streamed into destination-local temporary storage, checked with SHA-256 and a byte count, and atomically published without overwriting existing content. Relative hierarchy, last-modified timestamps, and basic hidden/read-only attributes are preserved; ownership, ACLs, alternate data streams, and other security metadata are not copied. Rejected or mismatched content is removed, and the source is never modified.
 
 Transfer Offers are serialized in session order, so later `send` commands wait in memory while one offer is being reviewed or transferred. Every offer requires a separate receiving-Peer decision, and queued offers are discarded when the Transfer Session ends. Additional connection attempts receive a busy outcome while a session is pending or active.
 

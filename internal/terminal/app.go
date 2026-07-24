@@ -76,6 +76,7 @@ type attempt struct {
 	incoming          *incomingOffer
 	outgoing          *outgoingOffer
 	outgoingQueue     []*outgoingOffer
+	pendingIncoming   map[string]*incomingOffer
 	coordinatorQueue  []queuedOffer
 	coordinatorActive bool
 	lastActivity      time.Time
@@ -92,25 +93,25 @@ type queuedOffer struct {
 }
 
 type incomingOffer struct {
-	id          string
-	name        string
-	size        int64
-	destination string
-	finalPath   string
-	actions     chan offerAction
-	waiting     bool
-	accepted    bool
-	stagingPath string
-	stagingFile *os.File
-	reviewDone  chan struct{}
+	id            string
+	manifest      offerManifest
+	destination   string
+	actions       chan offerAction
+	waiting       bool
+	accepted      bool
+	collecting    bool
+	stagingPath   string
+	stagingFile   *os.File
+	activeEntry   *manifestEntry
+	finalPaths    map[string]string
+	completedFile int
+	rootCount     int
+	reviewDone    chan struct{}
 }
 
 type outgoingOffer struct {
 	id        string
-	path      string
-	name      string
-	size      int64
-	modified  time.Time
+	manifest  offerManifest
 	decision  chan session.Message
 	result    chan session.Message
 	queued    chan bool
@@ -263,12 +264,12 @@ func (a *App) handleLine(line string) bool {
 		}
 		a.connectTarget(argument)
 	case "send":
-		path, ok := onePathArgument(argument)
+		paths, ok := parsePathArguments(argument)
 		if !ok {
-			a.line("Usage: send <path>")
+			a.line("Usage: send <path>...")
 			return false
 		}
-		a.sendFile(path)
+		a.sendPaths(paths)
 	case "disconnect":
 		if argument != "" {
 			a.line("Usage: disconnect")
@@ -285,7 +286,7 @@ func (a *App) handleLine(line string) bool {
 		return true
 	case "help":
 		a.printCommands()
-	case "accept", "reject", "destination":
+	case "accept", "reject", "destination", "details":
 		a.line("There is no Transfer Offer awaiting approval.")
 	default:
 		a.line("Unknown command %q. Type help for available commands.", command)
@@ -313,7 +314,7 @@ func onePathArgument(argument string) (string, bool) {
 }
 
 func (a *App) printCommands() {
-	a.line("Commands: connect <peer-number|IPv4:port>, send <path>, keep-alive, disconnect, quit")
+	a.line("Commands: connect <peer-number|IPv4:port>, send <path>..., keep-alive, disconnect, quit")
 }
 
 func (a *App) connectTarget(target string) {
@@ -420,6 +421,12 @@ func (a *App) answerPendingOffer(line string) bool {
 			return true
 		}
 		action.kind = "reject"
+	case "details":
+		if argument != "" {
+			a.line("Usage: details")
+			return true
+		}
+		action.kind = "details"
 	case "destination":
 		path, ok := onePathArgument(argument)
 		if !ok {
@@ -431,7 +438,7 @@ func (a *App) answerPendingOffer(line string) bool {
 	case "send", "help", "keep-alive", "disconnect", "quit", "exit":
 		return false
 	default:
-		a.line("Choose accept, reject, or destination <path> for this Transfer Offer.")
+		a.line("Choose accept, reject, destination <path>, or details for this Transfer Offer.")
 		return true
 	}
 
@@ -619,6 +626,10 @@ func (a *App) serveSession(current *attempt) error {
 			if err := a.handleIncomingOffer(current, message); err != nil {
 				return err
 			}
+		case "manifest-entry", "manifest-omission", "offer-complete":
+			if err := a.handleIncomingManifest(current, message); err != nil {
+				return err
+			}
 		case "queued":
 			if !a.routeQueuedOutgoing(current, message.OfferID) {
 				return errors.New("received a queue acknowledgement for an unknown Transfer Offer")
@@ -634,6 +645,10 @@ func (a *App) serveSession(current *attempt) error {
 		case "result":
 			if !a.routeOutgoing(current, message, false) {
 				return errors.New("received a result for an unknown Transfer Offer")
+			}
+		case "batch-complete":
+			if err := a.completeIncomingBatch(current, message); err != nil {
+				return err
 			}
 		case "abort":
 			a.abortIncoming(current, message)
@@ -705,7 +720,7 @@ func findOutgoingLocked(current *attempt, offerID string) *outgoingOffer {
 	return nil
 }
 
-func (a *App) sendFile(path string) {
+func (a *App) sendPaths(paths []string) {
 	a.mu.Lock()
 	current := a.current
 	if current == nil || current.secure == nil {
@@ -715,41 +730,17 @@ func (a *App) sendFile(path string) {
 	}
 	a.mu.Unlock()
 
-	absolutePath, err := filepath.Abs(path)
+	manifest, err := buildManifest(paths)
 	if err != nil {
-		a.line("Cannot offer %q: %v", path, err)
+		a.line("Cannot create Transfer Offer: %v", err)
 		return
 	}
-	info, err := os.Lstat(absolutePath)
-	if err != nil {
-		a.line("Cannot offer %q: %v", path, err)
-		return
-	}
-	if !info.Mode().IsRegular() {
-		a.line("Cannot offer %q: only one readable regular file is supported.", path)
-		return
-	}
-	probe, err := os.Open(absolutePath)
-	if err != nil {
-		a.line("Cannot offer %q: file is not readable: %v", path, err)
-		return
-	}
-	_ = probe.Close()
 	id, err := newOfferID()
 	if err != nil {
 		a.line("Cannot create Transfer Offer: %v", err)
 		return
 	}
-	outgoing := &outgoingOffer{
-		id:       id,
-		path:     absolutePath,
-		name:     info.Name(),
-		size:     info.Size(),
-		modified: info.ModTime(),
-		decision: make(chan session.Message, 1),
-		result:   make(chan session.Message, 1),
-		queued:   make(chan bool, 1),
-	}
+	outgoing := &outgoingOffer{id: id, manifest: manifest, decision: make(chan session.Message, 1), result: make(chan session.Message, 1), queued: make(chan bool, 1)}
 
 	a.mu.Lock()
 	if a.current != current || current.secure == nil {
@@ -757,10 +748,11 @@ func (a *App) sendFile(path string) {
 		a.line("The Transfer Session changed before the offer could be sent; try again.")
 		return
 	}
+	label := outgoingLabel(outgoing)
 	if current.role == session.Inbound {
 		if len(current.coordinatorQueue) >= maxQueuedOffers {
 			a.mu.Unlock()
-			a.line("Transfer Offer queue is full; wait for an offer to finish before sending %s.", outgoing.name)
+			a.line("Transfer Offer queue is full; wait for an offer to finish before sending %s.", label)
 			return
 		}
 		queued := current.coordinatorActive || len(current.coordinatorQueue) > 0
@@ -768,7 +760,7 @@ func (a *App) sendFile(path string) {
 		next := a.takeCoordinatorOfferLocked(current)
 		a.mu.Unlock()
 		if queued {
-			a.line("Transfer Offer queued: %s (%d bytes).", outgoing.name, outgoing.size)
+			a.line("Transfer Offer queued: %s (%d bytes).", label, manifest.TotalBytes)
 		}
 		a.startCoordinatorOffer(current, next)
 		return
@@ -776,24 +768,24 @@ func (a *App) sendFile(path string) {
 	if current.outgoing != nil {
 		if len(current.outgoingQueue) >= maxQueuedOffers {
 			a.mu.Unlock()
-			a.line("Transfer Offer queue is full; wait for an offer to finish before sending %s.", outgoing.name)
+			a.line("Transfer Offer queue is full; wait for an offer to finish before sending %s.", label)
 			return
 		}
 		outgoing.submitted = true
 		current.outgoingQueue = append(current.outgoingQueue, outgoing)
 		secured := current.secure
 		a.mu.Unlock()
-		if err := secured.Send(offerMessage(outgoing)); err != nil {
-			a.line("Could not queue Transfer Offer %s: %v", outgoing.name, err)
+		if err := sendManifest(secured, outgoing); err != nil {
+			a.line("Could not queue Transfer Offer %s: %v", label, err)
 			_ = secured.Close()
 			return
 		}
 		select {
 		case queued := <-outgoing.queued:
 			if queued {
-				a.line("Transfer Offer queued: %s (%d bytes).", outgoing.name, outgoing.size)
+				a.line("Transfer Offer queued: %s (%d bytes).", label, manifest.TotalBytes)
 			} else {
-				a.line("Peer could not queue Transfer Offer %s.", outgoing.name)
+				a.line("Peer could not queue Transfer Offer %s.", label)
 			}
 		case <-current.context.Done():
 		}
@@ -803,7 +795,7 @@ func (a *App) sendFile(path string) {
 	current.outgoing = outgoing
 	secured := current.secure
 	a.mu.Unlock()
-	if err := secured.Send(offerMessage(outgoing)); err != nil {
+	if err := sendManifest(secured, outgoing); err != nil {
 		a.failOutgoing(current, outgoing, "Could not send Transfer Offer: %v", err)
 		_ = secured.Close()
 		return
@@ -811,20 +803,41 @@ func (a *App) sendFile(path string) {
 	go a.runOutgoing(current, outgoing)
 }
 
-func offerMessage(outgoing *outgoingOffer) session.Message {
-	return session.Message{Type: "offer", OfferID: outgoing.id, Name: outgoing.name, Size: outgoing.size}
+func outgoingLabel(outgoing *outgoingOffer) string {
+	if len(outgoing.manifest.Roots) == 1 {
+		return outgoing.manifest.Roots[0]
+	}
+	return fmt.Sprintf("%d roots", len(outgoing.manifest.Roots))
+}
+
+func sendManifest(secured *session.Session, outgoing *outgoingOffer) error {
+	manifest := outgoing.manifest
+	if err := secured.Send(session.Message{Type: "offer", OfferID: outgoing.id, RootCount: len(manifest.Roots), FileCount: manifest.FileCount, FolderCount: manifest.FolderCount, TotalBytes: manifest.TotalBytes}); err != nil {
+		return err
+	}
+	for _, entry := range manifest.Entries {
+		if err := secured.Send(session.Message{Type: "manifest-entry", OfferID: outgoing.id, Path: entry.Path, Kind: entry.Kind, Size: entry.Size, Modified: entry.Modified.UnixNano(), ReadOnly: entry.ReadOnly, Hidden: entry.Hidden}); err != nil {
+			return err
+		}
+	}
+	for _, omission := range manifest.Omissions {
+		if err := secured.Send(session.Message{Type: "manifest-omission", OfferID: outgoing.id, Path: omission.Path, Reason: omission.Reason}); err != nil {
+			return err
+		}
+	}
+	return secured.Send(session.Message{Type: "offer-complete", OfferID: outgoing.id})
 }
 
 func (a *App) runOutgoing(current *attempt, outgoing *outgoingOffer) {
 	if !outgoing.submitted {
-		if err := current.secure.Send(offerMessage(outgoing)); err != nil {
+		if err := sendManifest(current.secure, outgoing); err != nil {
 			a.failOutgoing(current, outgoing, "Could not send Transfer Offer: %v", err)
 			return
 		}
 		outgoing.submitted = true
 	}
-	a.line("Transfer Offer sent: %s (%d bytes). Waiting for the Peer.", outgoing.name, outgoing.size)
-
+	manifest := outgoing.manifest
+	a.line("Transfer Offer sent: %s (%d bytes). Waiting for the Peer.", outgoingLabel(outgoing), manifest.TotalBytes)
 	var decision session.Message
 	select {
 	case decision = <-outgoing.decision:
@@ -837,49 +850,36 @@ func (a *App) runOutgoing(current *attempt, outgoing *outgoingOffer) {
 	}
 	if !*decision.Accepted {
 		a.clearOutgoing(current, outgoing)
-		a.line("Peer rejected Transfer Offer %s. No file content was sent.", outgoing.name)
+		a.line("Peer rejected Transfer Offer %s. No file content was sent.", outgoingLabel(outgoing))
 		return
 	}
 
 	a.startTransfer(current)
-	source, err := os.Open(outgoing.path)
-	if err != nil {
-		_ = current.secure.Send(session.Message{Type: "abort", OfferID: outgoing.id, Reason: "source could not be opened"})
-		a.failOutgoing(current, outgoing, "Transfer failed for %s: source could not be opened: %v", outgoing.name, err)
-		return
-	}
-	before, err := source.Stat()
-	if err != nil || before.Size() != outgoing.size || !before.ModTime().Equal(outgoing.modified) {
-		_ = source.Close()
-		_ = current.secure.Send(session.Message{Type: "abort", OfferID: outgoing.id, Reason: "source changed after approval"})
-		a.failOutgoing(current, outgoing, "Transfer failed for %s: source changed after the offer was created.", outgoing.name)
-		return
-	}
-
-	progress := a.progress("Sending "+outgoing.name, outgoing.size)
-	var sourceReader io.Reader = source
-	if a.config.StreamChunkDelay > 0 {
-		sourceReader = &delayedReader{context: current.context, source: source, delay: a.config.StreamChunkDelay}
-	}
-	_, streamError := current.secure.SendStream(current.context, session.Message{
-		Type: "content", OfferID: outgoing.id, Size: outgoing.size,
-	}, sourceReader, outgoing.size, progress, func(digest string) (session.Message, error) {
-		after, err := source.Stat()
-		if err != nil || after.Size() != outgoing.size || !after.ModTime().Equal(outgoing.modified) {
-			return session.Message{}, errors.New("source changed while it was being read")
+	for index := range manifest.Entries {
+		entry := &manifest.Entries[index]
+		if entry.Kind != manifestFile {
+			continue
 		}
-		if a.config.CorruptDigest {
-			digest = corruptSHA256(digest)
+		if err := a.sendManifestFile(current, outgoing, entry); err != nil {
+			_ = current.secure.Send(session.Message{Type: "abort", OfferID: outgoing.id, Path: entry.Path, Reason: err.Error()})
+			a.failOutgoing(current, outgoing, "Transfer failed for %s: %v", entry.Path, err)
+			return
 		}
-		return session.Message{Type: "complete", OfferID: outgoing.id, Size: outgoing.size, Digest: digest}, nil
-	})
-	closeError := source.Close()
-	if streamError != nil || closeError != nil {
-		a.failOutgoing(current, outgoing, "Transfer failed for %s because the source changed or could not be read completely.", outgoing.name)
-		_ = current.secure.Close()
+		var result session.Message
+		select {
+		case result = <-outgoing.result:
+		case <-current.context.Done():
+			return
+		}
+		if result.Success == nil || !*result.Success {
+			a.failOutgoing(current, outgoing, "Transfer failed for %s: %s.", entry.Path, result.Reason)
+			return
+		}
+	}
+	if err := current.secure.Send(session.Message{Type: "batch-complete", OfferID: outgoing.id}); err != nil {
+		a.failOutgoing(current, outgoing, "Could not complete Transfer Offer: %v", err)
 		return
 	}
-
 	var result session.Message
 	select {
 	case result = <-outgoing.result:
@@ -888,14 +888,45 @@ func (a *App) runOutgoing(current *attempt, outgoing *outgoingOffer) {
 	}
 	a.clearOutgoing(current, outgoing)
 	if result.Success == nil || !*result.Success {
-		reason := result.Reason
-		if reason == "" {
-			reason = "the Peer could not verify or publish it"
-		}
-		a.line("Transfer failed for %s: %s.", outgoing.name, reason)
+		a.line("Transfer Offer failed: %s.", result.Reason)
 		return
 	}
-	a.line("Transfer complete: %s (%d bytes).", outgoing.name, outgoing.size)
+	if manifest.FileCount == 1 && manifest.FolderCount == 0 {
+		a.line("Transfer complete: %s (%d bytes).", manifest.Roots[0], manifest.TotalBytes)
+	} else {
+		a.line("Transfer complete: %d files, %d folders (%d bytes).", manifest.FileCount, manifest.FolderCount, manifest.TotalBytes)
+	}
+}
+
+func (a *App) sendManifestFile(current *attempt, outgoing *outgoingOffer, entry *manifestEntry) error {
+	source, err := os.Open(entry.SourcePath)
+	if err != nil {
+		return fmt.Errorf("source could not be opened: %w", err)
+	}
+	defer source.Close()
+	before, err := source.Stat()
+	if err != nil || before.Size() != entry.Size || !before.ModTime().Equal(entry.Modified) {
+		return errors.New("source changed after the offer was created")
+	}
+	progress := a.progress("Sending "+entry.Path, entry.Size)
+	var sourceReader io.Reader = source
+	if a.config.StreamChunkDelay > 0 {
+		sourceReader = &delayedReader{context: current.context, source: source, delay: a.config.StreamChunkDelay}
+	}
+	_, err = current.secure.SendStream(current.context, session.Message{Type: "content", OfferID: outgoing.id, Path: entry.Path, Size: entry.Size}, sourceReader, entry.Size, progress, func(digest string) (session.Message, error) {
+		after, statError := source.Stat()
+		if statError != nil || after.Size() != entry.Size || !after.ModTime().Equal(entry.Modified) {
+			return session.Message{}, errors.New("source changed while it was being read")
+		}
+		if a.config.CorruptDigest {
+			digest = corruptSHA256(digest)
+		}
+		return session.Message{Type: "complete", OfferID: outgoing.id, Path: entry.Path, Size: entry.Size, Digest: digest}, nil
+	})
+	if err != nil {
+		return errors.New("source changed or could not be read completely")
+	}
+	return nil
 }
 
 type delayedReader struct {
@@ -954,72 +985,138 @@ func (a *App) takeNextOutgoingLocked(current *attempt) *outgoingOffer {
 }
 
 func (a *App) handleIncomingOffer(current *attempt, message session.Message) error {
-	if message.OfferID == "" || message.Size < 0 || !safeFileName(message.Name) {
+	if message.OfferID == "" || message.RootCount < 1 || message.FileCount < 0 || message.FolderCount < 0 || message.TotalBytes < 0 {
 		return errors.New("Peer sent an invalid Transfer Offer")
 	}
 	destination, err := defaultDestination()
 	if err != nil {
 		return fmt.Errorf("resolve Downloads destination: %w", err)
 	}
-	finalPath, err := resolveFinalPath(destination, message.Name)
-	if err != nil {
-		return fmt.Errorf("resolve offered destination: %w", err)
-	}
-	incoming := &incomingOffer{
-		id:          message.OfferID,
-		name:        message.Name,
-		size:        message.Size,
-		destination: destination,
-		finalPath:   finalPath,
-		actions:     make(chan offerAction, 1),
-		waiting:     true,
-	}
-
+	incoming := &incomingOffer{id: message.OfferID, destination: destination, actions: make(chan offerAction, 1), collecting: true, rootCount: message.RootCount}
+	incoming.manifest.FileCount, incoming.manifest.FolderCount, incoming.manifest.TotalBytes = message.FileCount, message.FolderCount, message.TotalBytes
 	a.mu.Lock()
-	if current.role == session.Inbound {
-		if len(current.coordinatorQueue) >= maxQueuedOffers {
-			a.mu.Unlock()
-			accepted := false
-			return current.secure.Send(session.Message{Type: "decision", OfferID: incoming.id, Accepted: &accepted, Reason: "Transfer Offer queue is full"})
-		}
-		current.coordinatorQueue = append(current.coordinatorQueue, queuedOffer{incoming: incoming})
-		next := a.takeCoordinatorOfferLocked(current)
+	if current.pendingIncoming == nil {
+		current.pendingIncoming = make(map[string]*incomingOffer)
+	}
+	if _, exists := current.pendingIncoming[incoming.id]; exists {
 		a.mu.Unlock()
-		if err := current.secure.Send(session.Message{Type: "queued", OfferID: incoming.id}); err != nil {
+		return errors.New("Peer repeated a Transfer Offer identifier")
+	}
+	current.pendingIncoming[incoming.id] = incoming
+	a.mu.Unlock()
+	return nil
+}
+
+func (a *App) handleIncomingManifest(current *attempt, message session.Message) error {
+	a.mu.Lock()
+	incoming := current.pendingIncoming[message.OfferID]
+	a.mu.Unlock()
+	if incoming == nil || !incoming.collecting {
+		return errors.New("Peer sent manifest data without a matching Transfer Offer")
+	}
+	switch message.Type {
+	case "manifest-entry":
+		if !safeRelativePath(message.Path) || (message.Kind != manifestFile && message.Kind != manifestFolder) || message.Size < 0 || (message.Kind == manifestFolder && message.Size != 0) {
+			return errors.New("Peer sent an invalid manifest entry")
+		}
+		incoming.manifest.Entries = append(incoming.manifest.Entries, manifestEntry{Path: message.Path, Kind: message.Kind, Size: message.Size, Modified: time.Unix(0, message.Modified), ReadOnly: message.ReadOnly, Hidden: message.Hidden})
+	case "manifest-omission":
+		if !safeRelativePath(message.Path) || message.Reason == "" {
+			return errors.New("Peer sent an invalid manifest omission")
+		}
+		incoming.manifest.Omissions = append(incoming.manifest.Omissions, manifestOmission{Path: message.Path, Reason: message.Reason})
+	case "offer-complete":
+		if err := validateReceivedManifest(incoming); err != nil {
 			return err
 		}
-		a.startCoordinatorOffer(current, next)
-		return nil
-	}
-	if current.incoming != nil {
+		incoming.collecting = false
+		a.mu.Lock()
+		delete(current.pendingIncoming, incoming.id)
+		if current.role == session.Inbound {
+			if len(current.coordinatorQueue) >= maxQueuedOffers {
+				a.mu.Unlock()
+				accepted := false
+				return current.secure.Send(session.Message{Type: "decision", OfferID: incoming.id, Accepted: &accepted, Reason: "Transfer Offer queue is full"})
+			}
+			current.coordinatorQueue = append(current.coordinatorQueue, queuedOffer{incoming: incoming})
+			next := a.takeCoordinatorOfferLocked(current)
+			a.mu.Unlock()
+			if err := current.secure.Send(session.Message{Type: "queued", OfferID: incoming.id}); err != nil {
+				return err
+			}
+			a.startCoordinatorOffer(current, next)
+			return nil
+		}
+		if current.incoming != nil {
+			a.mu.Unlock()
+			return errors.New("coordinating Peer sent overlapping Transfer Offers")
+		}
+		current.incoming = incoming
 		a.mu.Unlock()
-		return errors.New("coordinating Peer sent overlapping Transfer Offers")
+		a.startIncomingReview(current, incoming)
 	}
-	current.incoming = incoming
-	a.mu.Unlock()
-	a.startIncomingReview(current, incoming)
+	return nil
+}
+
+func safeRelativePath(path string) bool {
+	if path == "" || strings.ContainsAny(path, "\\\x00\r\n") {
+		return false
+	}
+	cleaned := filepath.ToSlash(filepath.Clean(filepath.FromSlash(path)))
+	return cleaned == path && path != "." && path != ".." && !strings.HasPrefix(path, "../") && !filepath.IsAbs(filepath.FromSlash(path))
+}
+
+func validateReceivedManifest(incoming *incomingOffer) error {
+	files, folders := 0, 0
+	var bytes int64
+	seen := make(map[string]struct{})
+	for _, entry := range incoming.manifest.Entries {
+		key := strings.ToLower(entry.Path)
+		if _, exists := seen[key]; exists {
+			return errors.New("Peer sent duplicate manifest paths")
+		}
+		seen[key] = struct{}{}
+		if entry.Kind == manifestFile {
+			files++
+			bytes += entry.Size
+		} else {
+			folders++
+		}
+		if !strings.Contains(entry.Path, "/") {
+			incoming.manifest.Roots = append(incoming.manifest.Roots, entry.Path)
+		}
+	}
+	if files != incoming.manifest.FileCount || folders != incoming.manifest.FolderCount || bytes != incoming.manifest.TotalBytes || len(incoming.manifest.Roots) != incoming.rootCount {
+		return errors.New("Peer sent an inconsistent Transfer Offer manifest")
+	}
 	return nil
 }
 
 func (a *App) reviewIncomingOffer(current *attempt, incoming *incomingOffer) error {
+	if err := resolveIncomingPaths(incoming); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	incoming.waiting = true
+	a.mu.Unlock()
 	a.showIncoming(incoming)
 	for {
 		select {
 		case action := <-incoming.actions:
 			switch action.kind {
+			case "details":
+				a.showManifestDetails(incoming)
 			case "destination":
-				destination, absoluteError := filepath.Abs(action.destination)
-				if absoluteError != nil {
-					a.line("Cannot use destination %q: %v", action.destination, absoluteError)
-					continue
-				}
-				finalPath, resolveError := resolveFinalPath(destination, incoming.name)
-				if resolveError != nil {
-					a.line("Cannot use destination %q: %v", action.destination, resolveError)
+				destination, err := filepath.Abs(action.destination)
+				if err != nil {
+					a.line("Cannot use destination %q: %v", action.destination, err)
 					continue
 				}
 				incoming.destination = filepath.Clean(destination)
-				incoming.finalPath = finalPath
+				if err := resolveIncomingPaths(incoming); err != nil {
+					a.line("Cannot use destination %q: %v", action.destination, err)
+					continue
+				}
 				a.line("Destination updated for this Transfer Offer only.")
 				a.showIncoming(incoming)
 			case "reject":
@@ -1058,89 +1155,191 @@ func (a *App) reviewIncomingOffer(current *attempt, incoming *incomingOffer) err
 	}
 }
 
+func resolveIncomingPaths(incoming *incomingOffer) error {
+	incoming.finalPaths = make(map[string]string)
+	for _, root := range incoming.manifest.Roots {
+		path, err := resolveFinalPath(incoming.destination, root)
+		if err != nil {
+			return err
+		}
+		incoming.finalPaths[strings.ToLower(root)] = path
+	}
+	return nil
+}
+
 func (a *App) showIncoming(incoming *incomingOffer) {
-	a.line("Transfer Offer: %s (%d bytes)", incoming.name, incoming.size)
+	manifest := incoming.manifest
+	if manifest.FileCount == 1 && manifest.FolderCount == 0 && len(manifest.Roots) == 1 {
+		a.line("Transfer Offer: %s (%d bytes)", manifest.Roots[0], manifest.TotalBytes)
+	} else {
+		a.line("Transfer Offer: %d top-level roots, %d files, %d folders (%d bytes)", len(manifest.Roots), manifest.FileCount, manifest.FolderCount, manifest.TotalBytes)
+		a.line("Top-level roots: %s", strings.Join(manifest.Roots, ", "))
+	}
 	a.line("Destination: %s", incoming.destination)
-	a.line("Final path: %s", incoming.finalPath)
-	a.line("Choose accept, reject, or destination <path>.")
+	for _, root := range manifest.Roots {
+		a.line("Final path: %s", incoming.finalPaths[strings.ToLower(root)])
+	}
+	if len(manifest.Omissions) > 0 {
+		a.line("Omissions: %d unsupported, unreadable, or vanished entries (type details to review)", len(manifest.Omissions))
+	}
+	if manifest.FileCount == 1 && manifest.FolderCount == 0 {
+		a.line("Choose accept, reject, or destination <path>.")
+	} else {
+		a.line("Choose accept, reject, destination <path>, or details.")
+	}
+}
+
+func (a *App) showManifestDetails(incoming *incomingOffer) {
+	a.line("Complete manifest:")
+	for _, entry := range incoming.manifest.Entries {
+		attributes := make([]string, 0, 2)
+		if entry.Hidden {
+			attributes = append(attributes, "hidden")
+		}
+		if entry.ReadOnly {
+			attributes = append(attributes, "read-only")
+		}
+		if len(attributes) == 0 {
+			attributes = append(attributes, "none")
+		}
+		if entry.Kind == manifestFile {
+			a.line("  file %s (%d bytes), modified %s, attributes %s", entry.Path, entry.Size, entry.Modified.Format(time.RFC3339Nano), strings.Join(attributes, ", "))
+		} else {
+			a.line("  folder %s, modified %s, attributes %s", entry.Path, entry.Modified.Format(time.RFC3339Nano), strings.Join(attributes, ", "))
+		}
+	}
+	for _, omission := range incoming.manifest.Omissions {
+		a.line("  omitted %s: %s", omission.Path, omission.Reason)
+	}
 }
 
 func prepareIncoming(incoming *incomingOffer) error {
 	if err := os.MkdirAll(incoming.destination, 0o755); err != nil {
 		return err
 	}
-	stagingDirectory := filepath.Join(incoming.destination, ".transferly-staging")
-	if err := os.MkdirAll(stagingDirectory, 0o700); err != nil {
-		return err
+	for _, entry := range incoming.manifest.Entries {
+		if entry.Kind == manifestFolder {
+			if err := os.MkdirAll(incomingPath(incoming, entry), 0o755); err != nil {
+				return err
+			}
+		}
 	}
-	file, err := os.CreateTemp(stagingDirectory, "incoming-*.part")
-	if err != nil {
-		return err
+	return os.MkdirAll(filepath.Join(incoming.destination, ".transferly-staging"), 0o700)
+}
+
+func incomingPath(incoming *incomingOffer, entry manifestEntry) string {
+	parts := strings.Split(entry.Path, "/")
+	root := incoming.finalPaths[strings.ToLower(parts[0])]
+	if len(parts) == 1 {
+		return root
 	}
-	incoming.stagingPath = file.Name()
-	incoming.stagingFile = file
-	return nil
+	return filepath.Join(root, filepath.Join(parts[1:]...))
 }
 
 func (a *App) receiveContent(current *attempt, message session.Message) error {
 	a.mu.Lock()
 	incoming := current.incoming
 	a.mu.Unlock()
-	if incoming == nil || !incoming.accepted || incoming.id != message.OfferID || incoming.size != message.Size || incoming.stagingFile == nil {
+	if incoming == nil || !incoming.accepted || incoming.id != message.OfferID {
 		return errors.New("Peer sent file content without an accepted matching Transfer Offer")
 	}
-
-	progress := a.progress("Receiving "+incoming.name, incoming.size)
-	digest, err := current.secure.ReceiveStream(current.context, incoming.stagingFile, incoming.size, progress)
+	var entry *manifestEntry
+	for index := range incoming.manifest.Entries {
+		if incoming.manifest.Entries[index].Path == message.Path {
+			entry = &incoming.manifest.Entries[index]
+			break
+		}
+	}
+	if entry == nil || entry.Kind != manifestFile || entry.Size != message.Size {
+		return errors.New("Peer sent content for an unknown manifest file")
+	}
+	file, err := os.CreateTemp(filepath.Join(incoming.destination, ".transferly-staging"), "incoming-*.part")
+	if err != nil {
+		return err
+	}
+	incoming.stagingFile, incoming.stagingPath, incoming.activeEntry = file, file.Name(), entry
+	progress := a.progress("Receiving "+entry.Path, entry.Size)
+	digest, err := current.secure.ReceiveStream(current.context, file, entry.Size, progress)
 	if err != nil {
 		a.cleanupIncoming(current)
-		return fmt.Errorf("receive %s: %w", incoming.name, err)
+		return fmt.Errorf("receive %s: %w", entry.Path, err)
 	}
-	if err := incoming.stagingFile.Sync(); err != nil {
+	if err := file.Sync(); err != nil {
 		a.cleanupIncoming(current)
 		return fmt.Errorf("flush temporary file: %w", err)
 	}
-	if err := incoming.stagingFile.Close(); err != nil {
+	if err := file.Close(); err != nil {
 		incoming.stagingFile = nil
 		a.cleanupIncoming(current)
 		return fmt.Errorf("close temporary file: %w", err)
 	}
 	incoming.stagingFile = nil
-
 	completion, err := current.secure.Receive()
 	if err != nil {
 		a.cleanupIncoming(current)
 		return err
 	}
-	if completion.Type != "complete" || completion.OfferID != incoming.id || completion.Size != incoming.size {
+	if completion.Type != "complete" || completion.OfferID != incoming.id || completion.Path != entry.Path || completion.Size != entry.Size {
 		a.cleanupIncoming(current)
 		return errors.New("Peer sent an invalid file completion frame")
 	}
 	if len(completion.Digest) != 64 || !strings.EqualFold(completion.Digest, digest) {
 		a.removeIncomingFiles(incoming)
 		success := false
-		_ = current.secure.Send(session.Message{Type: "result", OfferID: incoming.id, Success: &success, Reason: "size or SHA-256 integrity check failed"})
+		_ = current.secure.Send(session.Message{Type: "result", OfferID: incoming.id, Path: entry.Path, Success: &success, Reason: "size or SHA-256 integrity check failed"})
 		a.clearIncoming(current, incoming)
-		a.line("Transfer failed for %s: size or SHA-256 integrity check failed; incomplete content was removed.", incoming.name)
+		a.line("Transfer failed for %s: size or SHA-256 integrity check failed; incomplete content was removed.", entry.Path)
 		return nil
 	}
-	if err := publishWithoutOverwrite(incoming.stagingPath, incoming.finalPath); err != nil {
+	finalPath := incomingPath(incoming, *entry)
+	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil {
+		return err
+	}
+	if err := publishWithoutOverwrite(incoming.stagingPath, finalPath); err != nil {
 		a.removeIncomingFiles(incoming)
 		success := false
-		_ = current.secure.Send(session.Message{Type: "result", OfferID: incoming.id, Success: &success, Reason: "final path became unavailable"})
+		_ = current.secure.Send(session.Message{Type: "result", OfferID: incoming.id, Path: entry.Path, Success: &success, Reason: "final path became unavailable"})
 		a.clearIncoming(current, incoming)
-		a.line("Transfer failed for %s: final path became unavailable; existing content was not overwritten.", incoming.name)
 		return nil
 	}
 	incoming.stagingPath = ""
+	if err := applyBasicMetadata(finalPath, *entry); err != nil {
+		return fmt.Errorf("apply metadata to %s: %w", entry.Path, err)
+	}
+	incoming.completedFile++
+	success := true
+	if err := current.secure.Send(session.Message{Type: "result", OfferID: incoming.id, Path: entry.Path, Success: &success}); err != nil {
+		return err
+	}
+	a.line("Received %s (%d bytes) at %s.", entry.Path, entry.Size, finalPath)
+	return nil
+}
+
+func (a *App) completeIncomingBatch(current *attempt, message session.Message) error {
+	a.mu.Lock()
+	incoming := current.incoming
+	a.mu.Unlock()
+	if incoming == nil || !incoming.accepted || incoming.id != message.OfferID || incoming.completedFile != incoming.manifest.FileCount {
+		return errors.New("Peer completed an inconsistent Transfer Offer")
+	}
+	for index := len(incoming.manifest.Entries) - 1; index >= 0; index-- {
+		entry := incoming.manifest.Entries[index]
+		if entry.Kind == manifestFolder {
+			if err := applyBasicMetadata(incomingPath(incoming, entry), entry); err != nil {
+				return err
+			}
+		}
+	}
 	removeEmptyStagingDirectory(incoming.destination)
 	success := true
 	if err := current.secure.Send(session.Message{Type: "result", OfferID: incoming.id, Success: &success}); err != nil {
-		a.clearIncoming(current, incoming)
 		return err
 	}
+	manifest := incoming.manifest
 	a.clearIncoming(current, incoming)
-	a.line("Received %s (%d bytes) at %s.", incoming.name, incoming.size, incoming.finalPath)
+	if manifest.FileCount != 1 || manifest.FolderCount != 0 {
+		a.line("Received Transfer Offer: %d files, %d folders (%d bytes)", manifest.FileCount, manifest.FolderCount, manifest.TotalBytes)
+	}
 	return nil
 }
 
@@ -1157,7 +1356,7 @@ func (a *App) abortIncoming(current *attempt, message session.Message) {
 	if reason == "" {
 		reason = "the sender stopped the transfer"
 	}
-	a.line("Transfer failed for %s: %s; incomplete content was removed.", incoming.name, reason)
+	a.line("Transfer failed for %s: %s; incomplete content was removed.", message.Path, reason)
 }
 
 func (a *App) clearIncoming(current *attempt, incoming *incomingOffer) {

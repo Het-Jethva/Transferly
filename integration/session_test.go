@@ -98,6 +98,73 @@ func buildExecutable(destination string, extraArguments ...string) error {
 	return nil
 }
 
+func TestMixedFilesAndFoldersArePublishedAsOneTransferOffer(t *testing.T) {
+	sender := startPeer(t, transferlyExecutable)
+	receiver := startPeer(t, transferlyExecutable)
+	verifyPeers(t, sender, receiver)
+
+	source := t.TempDir()
+	folder := filepath.Join(source, "Project Ω")
+	if err := os.MkdirAll(filepath.Join(folder, "nested", "empty"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	notesSource := filepath.Join(folder, "nested", "notes.txt")
+	if err := os.WriteFile(notesSource, []byte("nested notes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	modified := time.Date(2024, time.January, 2, 3, 4, 6, 0, time.Local)
+	if err := os.Chtimes(notesSource, modified, modified); err != nil {
+		t.Fatal(err)
+	}
+	if err := addFileAttributes(notesSource, testFileAttributeReadOnly); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(notesSource, 0o600) })
+	hiddenSource := filepath.Join(folder, ".hidden")
+	if err := os.WriteFile(hiddenSource, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := addFileAttributes(hiddenSource, testFileAttributeHidden); err != nil {
+		t.Fatal(err)
+	}
+	standalone := filepath.Join(source, "standalone.txt")
+	if err := os.WriteFile(standalone, []byte("standalone"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sender.send(t, `send "`+folder+`" "`+standalone+`"`)
+	receiver.waitFor(t, "Transfer Offer: 2 top-level roots, 3 files, 3 folders (22 bytes)")
+	receiver.waitFor(t, "Top-level roots: Project Ω, standalone.txt")
+	receiver.waitFor(t, "Choose accept, reject, destination <path>, or details.")
+	receiver.send(t, "details")
+	receiver.waitFor(t, "folder Project Ω/nested/empty")
+	receiver.waitFor(t, "file Project Ω/.hidden (0 bytes)")
+	receiver.send(t, "accept")
+	sender.waitFor(t, "Transfer complete: 3 files, 3 folders (22 bytes).")
+	receiver.waitFor(t, "Received Transfer Offer: 3 files, 3 folders (22 bytes)")
+
+	downloads := filepath.Join(receiver.homeDir, "Downloads")
+	notesDestination := filepath.Join(downloads, "Project Ω", "nested", "notes.txt")
+	assertFileContent(t, notesDestination, "nested notes")
+	t.Cleanup(func() { _ = os.Chmod(notesDestination, 0o600) })
+	notesInfo, err := os.Stat(notesDestination)
+	if err != nil || notesInfo.ModTime().Sub(modified).Abs() > 2*time.Second {
+		t.Fatalf("last-modified timestamp was not preserved: info=%v err=%v", notesInfo, err)
+	}
+	if preserved, err := fileHasAttributes(notesDestination, testFileAttributeReadOnly); err != nil || !preserved {
+		t.Fatalf("read-only attribute was not preserved: preserved=%v err=%v", preserved, err)
+	}
+	hiddenDestination := filepath.Join(downloads, "Project Ω", ".hidden")
+	assertFileContent(t, hiddenDestination, "")
+	if preserved, err := fileHasAttributes(hiddenDestination, testFileAttributeHidden); err != nil || !preserved {
+		t.Fatalf("hidden attribute was not preserved: preserved=%v err=%v", preserved, err)
+	}
+	assertFileContent(t, filepath.Join(downloads, "standalone.txt"), "standalone")
+	if info, err := os.Stat(filepath.Join(downloads, "Project Ω", "nested", "empty")); err != nil || !info.IsDir() {
+		t.Fatalf("empty folder was not published: info=%v err=%v", info, err)
+	}
+}
+
 func TestAcceptedFileIsPublishedWithoutChangingTheSource(t *testing.T) {
 	sender := startPeer(t, transferlyExecutable)
 	receiver := startPeer(t, transferlyExecutable)
@@ -206,35 +273,67 @@ func TestDigestMismatchRemovesIncompleteContent(t *testing.T) {
 	receiver.send(t, "reject")
 }
 
-func TestInvalidMissingAndUnsupportedSourcesDoNotEndTheSession(t *testing.T) {
+func TestMissingAndUnsupportedSourcesAreReportedWithoutEndingTheSession(t *testing.T) {
 	sender := startPeer(t, transferlyExecutable)
 	receiver := startPeer(t, transferlyExecutable)
 	verifyPeers(t, sender, receiver)
 
 	sender.send(t, "send")
-	sender.waitFor(t, "Usage: send <path>")
+	sender.waitFor(t, "Usage: send <path>...")
 	missing := filepath.Join(t.TempDir(), "missing.txt")
 	sender.send(t, "send "+missing)
-	sender.waitFor(t, "Cannot offer")
-	folder := t.TempDir()
-	sender.send(t, "send "+folder)
-	sender.waitFor(t, "only one readable regular file is supported")
+	sender.waitFor(t, "Cannot create Transfer Offer")
 
-	target := filepath.Join(t.TempDir(), "target.txt")
-	if err := os.WriteFile(target, []byte("target"), 0o600); err != nil {
+	folder := filepath.Join(t.TempDir(), "batch")
+	if err := os.Mkdir(folder, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	link := filepath.Join(t.TempDir(), "linked.txt")
-	if err := os.Symlink(target, link); err == nil {
-		unsupportedBefore := sender.count("only one readable regular file is supported")
-		sender.send(t, "send "+link)
-		sender.waitForCount(t, "only one readable regular file is supported", unsupportedBefore+1)
-	}
-
-	valid := filepath.Join(t.TempDir(), "valid.txt")
+	valid := filepath.Join(folder, "valid.txt")
 	if err := os.WriteFile(valid, []byte("still connected"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	target := filepath.Join(t.TempDir(), "target-folder")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "must-not-transfer.txt"), []byte("target"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(folder, "linked-folder")
+	linked := createReparsePoint(link, target) == nil
+	unreadablePath := filepath.Join(folder, "unreadable.txt")
+	if err := os.WriteFile(unreadablePath, []byte("private"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restoreReadable, unreadable := makeUnreadable(unreadablePath)
+	t.Cleanup(restoreReadable)
+
+	sender.send(t, "send "+folder)
+	expectedFiles, expectedBytes := 2, 22
+	if unreadable {
+		expectedFiles, expectedBytes = 1, 15
+	}
+	receiver.waitFor(t, fmt.Sprintf("Transfer Offer: 1 top-level roots, %d files, 1 folders (%d bytes)", expectedFiles, expectedBytes))
+	omissions := 0
+	if linked {
+		omissions++
+	}
+	if unreadable {
+		omissions++
+	}
+	if omissions > 0 {
+		receiver.waitFor(t, fmt.Sprintf("Omissions: %d unsupported, unreadable, or vanished entries", omissions))
+		receiver.send(t, "details")
+		if linked {
+			receiver.waitFor(t, "omitted batch/linked-folder: symbolic link, junction, or reparse point is unsupported")
+		}
+		if unreadable {
+			receiver.waitFor(t, "omitted batch/unreadable.txt:")
+		}
+	}
+	receiver.send(t, "reject")
+	sender.waitFor(t, "Peer rejected Transfer Offer batch")
+
 	sender.send(t, "send "+valid)
 	receiver.waitFor(t, "Transfer Offer: valid.txt (15 bytes)")
 	receiver.send(t, "reject")
@@ -883,6 +982,17 @@ func startPeerAt(t *testing.T, executable, listenAddress string) *peerProcess {
 	}
 	peer.endpoint = match[1]
 	return peer
+}
+
+func assertFileContent(t *testing.T, path, expected string) {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != expected {
+		t.Fatalf("%s = %q, want %q", path, content, expected)
+	}
 }
 
 func fileSHA256(t *testing.T, path string) [sha256.Size]byte {

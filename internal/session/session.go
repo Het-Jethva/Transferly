@@ -78,14 +78,23 @@ type Session struct {
 // has been verified. File bytes are streamed separately by SendStream and
 // ReceiveStream so their size is not limited by control-frame bounds.
 type Message struct {
-	Type     string `json:"type"`
-	OfferID  string `json:"offer_id,omitempty"`
-	Name     string `json:"name,omitempty"`
-	Size     int64  `json:"size,omitempty"`
-	Accepted *bool  `json:"accepted,omitempty"`
-	Digest   string `json:"digest,omitempty"`
-	Success  *bool  `json:"success,omitempty"`
-	Reason   string `json:"reason,omitempty"`
+	Type        string `json:"type"`
+	OfferID     string `json:"offer_id,omitempty"`
+	Name        string `json:"name,omitempty"`
+	Size        int64  `json:"size,omitempty"`
+	Accepted    *bool  `json:"accepted,omitempty"`
+	Digest      string `json:"digest,omitempty"`
+	Success     *bool  `json:"success,omitempty"`
+	Reason      string `json:"reason,omitempty"`
+	Path        string `json:"path,omitempty"`
+	Kind        string `json:"kind,omitempty"`
+	Modified    int64  `json:"modified,omitempty"`
+	ReadOnly    bool   `json:"read_only,omitempty"`
+	Hidden      bool   `json:"hidden,omitempty"`
+	FileCount   int    `json:"file_count,omitempty"`
+	FolderCount int    `json:"folder_count,omitempty"`
+	RootCount   int    `json:"root_count,omitempty"`
+	TotalBytes  int64  `json:"total_bytes,omitempty"`
 }
 
 // Progress observes the number of file bytes copied through a stream.
