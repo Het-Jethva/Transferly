@@ -14,7 +14,7 @@ import (
 // wireMajor is a string so release builds can set it with -ldflags -X while
 // keeping wire-protocol versioning independent from the executable version.
 var (
-	wireMajor        = "2"
+	wireMajor        = "3"
 	corruptDigest    = "false" // Overridden only by protocol-boundary integration builds.
 	streamChunkDelay = "0s"    // Overridden only by process-level idle tests.
 	controllableTime = "false" // Overridden only by process-level idle tests.

@@ -3,11 +3,14 @@ package terminal
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net"
 	"os"
@@ -32,7 +35,10 @@ const (
 	messageActivity     = "activity"
 	messageKeepAlive    = "keepalive"
 	reasonOfferCanceled = "Transfer Offer canceled"
+	streamChunkBytes    = 1024 * 1024
 )
+
+var errOfferCanceled = errors.New(reasonOfferCanceled)
 
 // Config contains process-lifetime settings. It is intentionally not persisted.
 type Config struct {
@@ -102,9 +108,7 @@ type incomingOffer struct {
 	waiting            bool
 	accepted           bool
 	collecting         bool
-	stagingPath        string
-	stagingFile        *os.File
-	activeEntry        *manifestEntry
+	receivingFiles     map[string]*receivingFile
 	finalPaths         map[string]string
 	createdDirectories []string
 	staleStaging       bool
@@ -113,6 +117,17 @@ type incomingOffer struct {
 	fileOutcomes       map[string]struct{}
 	rootCount          int
 	reviewDone         chan struct{}
+}
+
+type receivingFile struct {
+	entry        *manifestEntry
+	stagingPath  string
+	file         *os.File
+	destination  *recoverableWriter
+	digest       hash.Hash
+	received     int64
+	progress     session.Progress
+	writeFailure error
 }
 
 type outgoingOffer struct {
@@ -666,6 +681,10 @@ func (a *App) serveSession(current *attempt) error {
 			if err := a.receiveContent(current, message); err != nil {
 				return err
 			}
+		case "complete":
+			if err := a.completeIncomingFile(current, message); err != nil {
+				return err
+			}
 		case "file-failed":
 			if err := a.receiveFileFailure(current, message); err != nil {
 				return err
@@ -772,7 +791,7 @@ func (a *App) sendPaths(paths []string) {
 		a.line("Cannot create Transfer Offer: %v", err)
 		return
 	}
-	outgoing := &outgoingOffer{id: id, manifest: manifest, decision: make(chan session.Message, 1), result: make(chan session.Message, 1), queued: make(chan bool, 1)}
+	outgoing := &outgoingOffer{id: id, manifest: manifest, decision: make(chan session.Message, 1), result: make(chan session.Message, 8), queued: make(chan bool, 1)}
 
 	a.mu.Lock()
 	if a.current != current || current.secure == nil {
@@ -887,33 +906,75 @@ func (a *App) runOutgoing(current *attempt, outgoing *outgoingOffer) {
 	}
 
 	a.startTransfer(current)
-	succeeded, failed := 0, 0
+	files := make([]*manifestEntry, 0, manifest.FileCount)
 	for index := range manifest.Entries {
-		entry := &manifest.Entries[index]
-		if entry.Kind != manifestFile {
-			continue
+		if manifest.Entries[index].Kind == manifestFile {
+			files = append(files, &manifest.Entries[index])
 		}
-		a.mu.Lock()
-		canceled := outgoing.canceled
-		a.mu.Unlock()
-		if canceled {
-			select {
-			case <-outgoing.result:
-			case <-current.context.Done():
-				return
+	}
+	concurrency := adaptiveFileConcurrency(files)
+	if concurrency > 1 {
+		a.line("Adaptive scheduling: up to %d concurrent file streams with bounded buffers.", concurrency)
+	}
+	progress := newOfferProgress(a, manifest.FileCount, manifest.TotalBytes)
+	jobs := make(chan *manifestEntry, len(files))
+	for _, entry := range files {
+		jobs <- entry
+	}
+	close(jobs)
+
+	workerErrors := make(chan error, concurrency)
+	var workers sync.WaitGroup
+	var started sync.WaitGroup
+	started.Add(concurrency)
+	release := make(chan struct{})
+	for worker := 0; worker < concurrency; worker++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			first := true
+			for entry := range jobs {
+				observe, streamDone := progress.begin(entry.Path, entry.Size)
+				if first {
+					started.Done()
+					<-release
+					first = false
+				}
+				a.mu.Lock()
+				canceled := outgoing.canceled
+				a.mu.Unlock()
+				if canceled {
+					streamDone()
+					return
+				}
+				err := a.sendManifestFile(current, outgoing, entry, observe)
+				streamDone()
+				if errors.Is(err, errOfferCanceled) {
+					return
+				}
+				if err != nil {
+					if sendError := current.secure.Send(session.Message{Type: "file-failed", OfferID: outgoing.id, Path: entry.Path, Reason: err.Error()}); sendError != nil {
+						select {
+						case workerErrors <- fmt.Errorf("transfer %s: %w", entry.Path, sendError):
+						default:
+						}
+						return
+					}
+				}
 			}
-			a.clearOutgoing(current, outgoing)
-			a.line("Transfer Offer canceled; incomplete content was removed and completed files were retained.")
-			return
-		}
-		if err := a.sendManifestFile(current, outgoing, entry); err != nil {
-			if sendError := current.secure.Send(session.Message{Type: "file-failed", OfferID: outgoing.id, Path: entry.Path, Reason: err.Error()}); sendError != nil {
-				a.failOutgoing(current, outgoing, "Transfer failed for %s: %v", entry.Path, sendError)
-				return
-			}
-		}
+		}()
+	}
+	started.Wait()
+	close(release)
+
+	succeeded, failed := 0, 0
+	for succeeded+failed < manifest.FileCount {
 		var result session.Message
 		select {
+		case err := <-workerErrors:
+			a.failOutgoing(current, outgoing, "Transfer failed: %v", err)
+			_ = current.secure.Close()
+			return
 		case result = <-outgoing.result:
 		case <-current.context.Done():
 			return
@@ -925,11 +986,14 @@ func (a *App) runOutgoing(current *attempt, outgoing *outgoingOffer) {
 				return
 			}
 			failed++
-			a.line("Transfer failed for %s: %s.", entry.Path, result.Reason)
+			progress.complete(result.Path, false)
+			a.line("Transfer failed for %s: %s.", result.Path, result.Reason)
 			continue
 		}
 		succeeded++
+		progress.complete(result.Path, true)
 	}
+	workers.Wait()
 	if err := current.secure.Send(session.Message{Type: "batch-complete", OfferID: outgoing.id}); err != nil {
 		a.failOutgoing(current, outgoing, "Could not complete Transfer Offer: %v", err)
 		return
@@ -956,7 +1020,19 @@ func (a *App) runOutgoing(current *attempt, outgoing *outgoingOffer) {
 	}
 }
 
-func (a *App) sendManifestFile(current *attempt, outgoing *outgoingOffer, entry *manifestEntry) error {
+func adaptiveFileConcurrency(files []*manifestEntry) int {
+	// Four or more files provide enough independent filesystem work to offset
+	// scheduling overhead. Smaller batches stay serial for lower latency.
+	if len(files) == 0 {
+		return 0
+	}
+	if len(files) < 4 {
+		return 1
+	}
+	return 4
+}
+
+func (a *App) sendManifestFile(current *attempt, outgoing *outgoingOffer, entry *manifestEntry, progress session.Progress) error {
 	source, err := os.Open(entry.SourcePath)
 	if err != nil {
 		return fmt.Errorf("source could not be opened: %w", err)
@@ -966,38 +1042,69 @@ func (a *App) sendManifestFile(current *attempt, outgoing *outgoingOffer, entry 
 	if err != nil || before.Size() != entry.Size || !before.ModTime().Equal(entry.Modified) {
 		return errors.New("source changed after approval")
 	}
-	progress := a.progress("Sending "+entry.Path, entry.Size)
-	var sourceReader io.Reader = source
-	if a.config.StreamChunkDelay > 0 {
-		sourceReader = &delayedReader{context: current.context, source: source, delay: a.config.StreamChunkDelay}
-	}
-	_, err = current.secure.SendStream(current.context, session.Message{Type: "content", OfferID: outgoing.id, Path: entry.Path, Size: entry.Size}, sourceReader, entry.Size, progress, func(digest string) (session.Message, error) {
-		after, statError := source.Stat()
-		completion := session.Message{Type: "complete", OfferID: outgoing.id, Path: entry.Path, Size: entry.Size, Digest: digest}
-		failed := false
-		if statError != nil || after.Size() != entry.Size || !after.ModTime().Equal(entry.Modified) {
-			completion.Success = &failed
-			completion.Reason = "source changed after approval"
-		}
-		if !strings.EqualFold(digest, entry.Digest) {
-			completion.Success = &failed
-			completion.Reason = "source changed after approval"
-		}
-		if a.config.CorruptDigest {
-			completion.Digest = corruptSHA256(digest)
-		}
+	hasher := sha256.New()
+	buffer := make([]byte, streamChunkBytes)
+	progress(0)
+	for offset := int64(0); offset < entry.Size || entry.Size == 0 && offset == 0; {
 		a.mu.Lock()
-		if outgoing.canceled {
-			completion.Success = &failed
-			completion.Reason = reasonOfferCanceled
-		}
+		canceled := outgoing.canceled
 		a.mu.Unlock()
-		return completion, nil
-	})
-	if err != nil {
-		return errors.New("source changed or could not be read completely")
+		if canceled {
+			return errOfferCanceled
+		}
+		chunkBytes := int64(len(buffer))
+		if remaining := entry.Size - offset; remaining < chunkBytes {
+			chunkBytes = remaining
+		}
+		if chunkBytes > 0 {
+			var sourceReader io.Reader = source
+			if a.config.StreamChunkDelay > 0 {
+				sourceReader = &delayedReader{context: current.context, source: source, delay: a.config.StreamChunkDelay}
+			}
+			if _, err := io.ReadFull(sourceReader, buffer[:chunkBytes]); err != nil {
+				return errors.New("source changed or could not be read completely")
+			}
+			_, _ = hasher.Write(buffer[:chunkBytes])
+		}
+		if err := current.secure.SendChunkChecked(current.context, session.Message{Type: "content", OfferID: outgoing.id, Path: entry.Path, Size: chunkBytes, Offset: offset}, bytes.NewReader(buffer[:chunkBytes]), chunkBytes, func() error {
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			if outgoing.canceled {
+				return errOfferCanceled
+			}
+			return nil
+		}); err != nil {
+			if errors.Is(err, errOfferCanceled) {
+				return err
+			}
+			return errors.New("source changed or could not be sent completely")
+		}
+		offset += chunkBytes
+		progress(offset)
+		if entry.Size == 0 {
+			break
+		}
 	}
-	return nil
+
+	digest := hex.EncodeToString(hasher.Sum(nil))
+	after, statError := source.Stat()
+	completion := session.Message{Type: "complete", OfferID: outgoing.id, Path: entry.Path, Size: entry.Size, Digest: digest}
+	failed := false
+	if statError != nil || after.Size() != entry.Size || !after.ModTime().Equal(entry.Modified) || !strings.EqualFold(digest, entry.Digest) {
+		completion.Success = &failed
+		completion.Reason = "source changed after approval"
+	}
+	if a.config.CorruptDigest {
+		completion.Digest = corruptSHA256(digest)
+	}
+	return current.secure.SendChecked(completion, func() error {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if outgoing.canceled {
+			return errOfferCanceled
+		}
+		return nil
+	})
 }
 
 type delayedReader struct {
@@ -1454,83 +1561,113 @@ func (a *App) receiveContent(current *attempt, message session.Message) error {
 	if incoming == nil || !incoming.accepted || incoming.id != message.OfferID {
 		return errors.New("Peer sent file content without an accepted matching Transfer Offer")
 	}
-	var entry *manifestEntry
-	for index := range incoming.manifest.Entries {
-		if incoming.manifest.Entries[index].Path == message.Path {
-			entry = &incoming.manifest.Entries[index]
-			break
-		}
+	entry := findManifestFile(incoming, message.Path)
+	if entry == nil || message.Size < 0 || message.Size > streamChunkBytes || message.Offset < 0 || message.Offset > entry.Size || message.Size > entry.Size-message.Offset {
+		return errors.New("Peer sent an invalid chunk for an unknown manifest file")
 	}
-	if entry == nil || entry.Kind != manifestFile || entry.Size != message.Size {
-		return errors.New("Peer sent content for an unknown manifest file")
-	}
+	key := manifestPathKey(entry.Path)
 	if incoming.fileOutcomes == nil {
 		incoming.fileOutcomes = make(map[string]struct{}, incoming.manifest.FileCount)
 	}
-	if _, completed := incoming.fileOutcomes[manifestPathKey(entry.Path)]; completed {
+	if _, completed := incoming.fileOutcomes[key]; completed {
 		return errors.New("Peer repeated an outcome for a manifest file")
 	}
-	stagingDirectory := filepath.Join(incoming.destination, ".transferly-staging")
-	if err := rejectReparseAncestors(incoming.destination, stagingDirectory); err != nil {
-		return fmt.Errorf("staging area became unsafe: %w", err)
+	if incoming.receivingFiles == nil {
+		incoming.receivingFiles = make(map[string]*receivingFile, 4)
 	}
-	if err := os.MkdirAll(stagingDirectory, 0o700); err != nil {
-		return fmt.Errorf("recreate staging area: %w", err)
+	stream := incoming.receivingFiles[key]
+	if stream == nil {
+		if message.Offset != 0 {
+			return errors.New("Peer started a file stream at a nonzero offset")
+		}
+		stream = a.startReceivingFile(incoming, entry)
+		incoming.receivingFiles[key] = stream
 	}
-	if err := rejectReparsePoint(stagingDirectory); err != nil {
-		return fmt.Errorf("staging area became unsafe: %w", err)
+	if stream.received != message.Offset {
+		return errors.New("Peer sent an overlapping or out-of-order file chunk")
 	}
-	file, createError := os.CreateTemp(stagingDirectory, "incoming-*.part")
-	var destination io.Writer = io.Discard
-	var writeFailure error
-	if createError != nil {
-		writeFailure = fmt.Errorf("create temporary file: %w", createError)
-	} else {
-		incoming.stagingFile, incoming.stagingPath, incoming.activeEntry = file, file.Name(), entry
-		destination = &recoverableWriter{destination: file}
+	var destination io.Writer = stream.digest
+	if stream.destination != nil {
+		destination = io.MultiWriter(stream.destination, stream.digest)
 	}
-	progress := a.progress("Receiving "+entry.Path, entry.Size)
-	digest, err := current.secure.ReceiveStream(current.context, destination, entry.Size, progress)
+	chunkStart := stream.received
+	err := current.secure.ReceiveChunk(current.context, destination, message.Size, func(completed int64) {
+		stream.progress(chunkStart + completed)
+	})
 	if err != nil {
 		a.cleanupIncoming(current)
 		return fmt.Errorf("receive %s: %w", entry.Path, err)
 	}
-	if writer, ok := destination.(*recoverableWriter); ok && writer.failure != nil {
-		writeFailure = writer.failure
+	stream.received += message.Size
+	if stream.destination != nil && stream.destination.failure != nil {
+		stream.writeFailure = stream.destination.failure
 	}
-	if file != nil {
-		if err := file.Sync(); err != nil && writeFailure == nil {
-			writeFailure = fmt.Errorf("flush temporary file: %w", err)
+	return nil
+}
+
+func findManifestFile(incoming *incomingOffer, path string) *manifestEntry {
+	for index := range incoming.manifest.Entries {
+		entry := &incoming.manifest.Entries[index]
+		if entry.Kind == manifestFile && entry.Path == path {
+			return entry
 		}
-		if err := file.Close(); err != nil && writeFailure == nil {
-			writeFailure = fmt.Errorf("close temporary file: %w", err)
-		}
-		incoming.stagingFile = nil
 	}
-	completion, err := current.secure.Receive()
+	return nil
+}
+
+func (a *App) startReceivingFile(incoming *incomingOffer, entry *manifestEntry) *receivingFile {
+	stream := &receivingFile{entry: entry, digest: sha256.New(), progress: a.progress("Receiving "+entry.Path, entry.Size)}
+	stagingDirectory := filepath.Join(incoming.destination, ".transferly-staging")
+	if err := rejectReparseAncestors(incoming.destination, stagingDirectory); err != nil {
+		stream.writeFailure = fmt.Errorf("staging area became unsafe: %w", err)
+		return stream
+	}
+	if err := os.MkdirAll(stagingDirectory, 0o700); err != nil {
+		stream.writeFailure = fmt.Errorf("recreate staging area: %w", err)
+		return stream
+	}
+	if err := rejectReparsePoint(stagingDirectory); err != nil {
+		stream.writeFailure = fmt.Errorf("staging area became unsafe: %w", err)
+		return stream
+	}
+	file, err := os.CreateTemp(stagingDirectory, "incoming-*.part")
 	if err != nil {
-		a.cleanupIncoming(current)
-		return err
+		stream.writeFailure = fmt.Errorf("create temporary file: %w", err)
+		return stream
 	}
-	if completion.Type != "complete" || completion.OfferID != incoming.id || completion.Path != entry.Path || completion.Size != entry.Size {
-		a.cleanupIncoming(current)
+	stream.file = file
+	stream.stagingPath = file.Name()
+	stream.destination = &recoverableWriter{destination: file}
+	return stream
+}
+
+func (a *App) completeIncomingFile(current *attempt, completion session.Message) error {
+	a.mu.Lock()
+	incoming := current.incoming
+	a.mu.Unlock()
+	if incoming == nil || !incoming.accepted || incoming.id != completion.OfferID {
+		return errors.New("Peer completed a file without an accepted matching Transfer Offer")
+	}
+	entry := findManifestFile(incoming, completion.Path)
+	key := manifestPathKey(completion.Path)
+	stream := incoming.receivingFiles[key]
+	if entry == nil || stream == nil || completion.Size != entry.Size || stream.received != entry.Size {
 		return errors.New("Peer sent an invalid file completion frame")
 	}
-	a.mu.Lock()
-	canceled := incoming.canceled || (completion.Success != nil && !*completion.Success && completion.Reason == reasonOfferCanceled)
-	a.mu.Unlock()
-	if canceled {
-		a.removeIncomingFiles(incoming)
-		success := false
-		_ = current.secure.Send(session.Message{Type: "result", OfferID: incoming.id, Path: entry.Path, Success: &success, Reason: reasonOfferCanceled})
-		a.clearIncoming(current, incoming)
-		a.line("Transfer Offer canceled; incomplete content was removed and completed files were retained.")
-		return nil
+	if stream.file != nil {
+		if err := stream.file.Sync(); err != nil && stream.writeFailure == nil {
+			stream.writeFailure = fmt.Errorf("flush temporary file: %w", err)
+		}
+		if err := stream.file.Close(); err != nil && stream.writeFailure == nil {
+			stream.writeFailure = fmt.Errorf("close temporary file: %w", err)
+		}
+		stream.file = nil
 	}
-	if writeFailure != nil {
-		return a.failIncomingFile(current, incoming, entry.Path, "destination write failed: "+writeFailure.Error())
+	digest := hex.EncodeToString(stream.digest.Sum(nil))
+	if stream.writeFailure != nil {
+		return a.failIncomingFile(current, incoming, entry.Path, "destination write failed: "+stream.writeFailure.Error())
 	}
-	if len(completion.Digest) != 64 || !strings.EqualFold(completion.Digest, digest) || !strings.EqualFold(entry.Digest, digest) || (completion.Success != nil && !*completion.Success) {
+	if len(completion.Digest) != 64 || !strings.EqualFold(completion.Digest, digest) || !strings.EqualFold(entry.Digest, digest) || completion.Success != nil && !*completion.Success {
 		reason := completion.Reason
 		if reason == "" {
 			reason = "size or SHA-256 integrity check failed"
@@ -1549,15 +1686,16 @@ func (a *App) receiveContent(current *attempt, message session.Message) error {
 	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil {
 		return err
 	}
-	if err := publishWithoutOverwrite(incoming.stagingPath, finalPath); err != nil {
+	if err := publishWithoutOverwrite(stream.stagingPath, finalPath); err != nil {
 		return a.failIncomingFile(current, incoming, entry.Path, "destination write failed: final path became unavailable")
 	}
-	incoming.stagingPath = ""
+	stream.stagingPath = ""
+	delete(incoming.receivingFiles, key)
 	if err := applyBasicMetadata(finalPath, *entry); err != nil {
-		_ = os.Remove(finalPath) // This offer created the path; never remove pre-existing content.
+		_ = os.Remove(finalPath)
 		return a.failIncomingFile(current, incoming, entry.Path, "destination metadata write failed: "+err.Error())
 	}
-	incoming.fileOutcomes[manifestPathKey(entry.Path)] = struct{}{}
+	incoming.fileOutcomes[key] = struct{}{}
 	incoming.completedFile++
 	success := true
 	if err := current.secure.Send(session.Message{Type: "result", OfferID: incoming.id, Path: entry.Path, Success: &success}); err != nil {
@@ -1589,7 +1727,7 @@ func (w *recoverableWriter) Write(content []byte) (int, error) {
 }
 
 func (a *App) failIncomingFile(current *attempt, incoming *incomingOffer, path, reason string) error {
-	a.removeIncomingStaging(incoming)
+	a.removeIncomingStream(incoming, path)
 	if incoming.fileOutcomes == nil {
 		incoming.fileOutcomes = make(map[string]struct{}, incoming.manifest.FileCount)
 	}
@@ -1632,6 +1770,7 @@ func (a *App) receiveFileFailure(current *attempt, message session.Message) erro
 	if _, completed := incoming.fileOutcomes[key]; completed {
 		return errors.New("Peer repeated an outcome for a manifest file")
 	}
+	a.removeIncomingStream(incoming, message.Path)
 	incoming.fileOutcomes[key] = struct{}{}
 	incoming.failedFile++
 	success := false
@@ -1718,7 +1857,9 @@ func (a *App) handlePeerCancellation(current *attempt, message session.Message) 
 	if current.outgoing != nil && current.outgoing.id == message.OfferID {
 		current.outgoing.canceled = true
 		a.mu.Unlock()
-		return nil
+		// Echo the ordered cancellation after stopping future chunks so the
+		// receiving Peer can clean every open staging stream and acknowledge it.
+		return current.secure.Send(session.Message{Type: "cancel", OfferID: message.OfferID})
 	}
 	incoming := current.incoming
 	if incoming == nil || incoming.id != message.OfferID || !incoming.accepted {
@@ -1842,14 +1983,33 @@ func (a *App) removeIncomingFiles(incoming *incomingOffer) {
 }
 
 func (a *App) removeIncomingStaging(incoming *incomingOffer) {
-	if incoming.stagingFile != nil {
-		_ = incoming.stagingFile.Close()
-		incoming.stagingFile = nil
+	for key, stream := range incoming.receivingFiles {
+		if stream.file != nil {
+			_ = stream.file.Close()
+			stream.file = nil
+		}
+		if stream.stagingPath != "" {
+			_ = os.Remove(stream.stagingPath)
+			stream.stagingPath = ""
+		}
+		delete(incoming.receivingFiles, key)
 	}
-	if incoming.stagingPath != "" {
-		_ = os.Remove(incoming.stagingPath)
-		incoming.stagingPath = ""
+	removeEmptyStagingDirectory(incoming.destination)
+}
+
+func (a *App) removeIncomingStream(incoming *incomingOffer, path string) {
+	key := manifestPathKey(path)
+	stream := incoming.receivingFiles[key]
+	if stream == nil {
+		return
 	}
+	if stream.file != nil {
+		_ = stream.file.Close()
+	}
+	if stream.stagingPath != "" {
+		_ = os.Remove(stream.stagingPath)
+	}
+	delete(incoming.receivingFiles, key)
 	removeEmptyStagingDirectory(incoming.destination)
 }
 

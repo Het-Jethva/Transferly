@@ -25,6 +25,7 @@ import (
 const (
 	verificationLabel = "transferly verification code v1"
 	maximumFrameBytes = 4096
+	streamBufferBytes = 1024 * 1024
 	handshakeTimeout  = 15 * time.Second
 )
 
@@ -69,9 +70,11 @@ func (e *VersionError) Error() string {
 // Session is a verified, encrypted connection. No application protocol data
 // can be exchanged through this interface until both Peers have confirmed.
 type Session struct {
-	connection *tls.Conn
-	reader     *bufio.Reader
-	writeMu    sync.Mutex
+	connection    *tls.Conn
+	reader        *bufio.Reader
+	writeMu       sync.Mutex
+	sendBuffer    []byte
+	receiveBuffer []byte
 }
 
 // Message is a bounded control frame exchanged only after a Transfer Session
@@ -95,6 +98,7 @@ type Message struct {
 	FolderCount int    `json:"folder_count,omitempty"`
 	RootCount   int    `json:"root_count,omitempty"`
 	TotalBytes  int64  `json:"total_bytes,omitempty"`
+	Offset      int64  `json:"offset,omitempty"`
 }
 
 // Progress observes the number of file bytes copied through a stream.
@@ -127,7 +131,12 @@ func Open(ctx context.Context, raw net.Conn, role Role, version Version, confirm
 	}
 
 	opened = true
-	return &Session{connection: protected, reader: reader}, nil
+	return &Session{
+		connection:    protected,
+		reader:        reader,
+		sendBuffer:    make([]byte, streamBufferBytes),
+		receiveBuffer: make([]byte, streamBufferBytes),
+	}, nil
 }
 
 // RejectBusy securely rejects an additional connection before human
@@ -211,8 +220,18 @@ func protectAndNegotiate(ctx context.Context, raw net.Conn, role Role, version V
 
 // Send writes one bounded control message to the verified Peer.
 func (s *Session) Send(message Message) error {
+	return s.SendChecked(message, nil)
+}
+
+// SendChecked validates an ordered control write while holding the wire.
+func (s *Session) SendChecked(message Message, ready func() error) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if ready != nil {
+		if err := ready(); err != nil {
+			return err
+		}
+	}
 	return writeFrame(s.connection, message)
 }
 
@@ -242,7 +261,7 @@ func (s *Session) SendStream(ctx context.Context, header Message, source io.Read
 		return "", err
 	}
 	hash := sha256.New()
-	if err := copyStream(ctx, io.MultiWriter(s.connection, hash), source, size, progress); err != nil {
+	if err := copyStreamBuffer(ctx, io.MultiWriter(s.connection, hash), source, size, progress, s.sendBuffer); err != nil {
 		return "", err
 	}
 	digest := hex.EncodeToString(hash.Sum(nil))
@@ -256,6 +275,42 @@ func (s *Session) SendStream(ctx context.Context, header Message, source io.Read
 	return digest, nil
 }
 
+// SendChunk writes one bounded content header and exactly size bytes while
+// holding the wire only for that chunk. Multiple file workers can therefore
+// interleave bounded chunks without buffering whole files.
+func (s *Session) SendChunk(ctx context.Context, header Message, source io.Reader, size int64) error {
+	return s.SendChunkChecked(ctx, header, source, size, nil)
+}
+
+// SendChunkChecked runs ready while holding the wire immediately before the
+// chunk header. It lets cancellation prevent a chunk from being emitted after
+// the ordered cancellation frame without exposing transport locking.
+func (s *Session) SendChunkChecked(ctx context.Context, header Message, source io.Reader, size int64, ready func() error) error {
+	if size < 0 {
+		return errors.New("chunk size cannot be negative")
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if ready != nil {
+		if err := ready(); err != nil {
+			return err
+		}
+	}
+	if err := writeFrame(s.connection, header); err != nil {
+		return err
+	}
+	return copyStreamBuffer(ctx, s.connection, source, size, nil, s.sendBuffer)
+}
+
+// ReceiveChunk reads exactly one multiplexed chunk without allocating or
+// hashing; the offer receiver owns the whole-file digest across chunks.
+func (s *Session) ReceiveChunk(ctx context.Context, destination io.Writer, size int64, progress Progress) error {
+	if size < 0 {
+		return errors.New("chunk size cannot be negative")
+	}
+	return copyStreamBuffer(ctx, destination, s.reader, size, progress, s.receiveBuffer)
+}
+
 // ReceiveStream reads exactly size bytes from the current content frame into
 // destination while independently computing SHA-256 with bounded memory.
 func (s *Session) ReceiveStream(ctx context.Context, destination io.Writer, size int64, progress Progress) (string, error) {
@@ -263,15 +318,20 @@ func (s *Session) ReceiveStream(ctx context.Context, destination io.Writer, size
 		return "", errors.New("stream size cannot be negative")
 	}
 	hash := sha256.New()
-	if err := copyStream(ctx, io.MultiWriter(destination, hash), s.reader, size, progress); err != nil {
+	if err := copyStreamBuffer(ctx, io.MultiWriter(destination, hash), s.reader, size, progress, s.receiveBuffer); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func copyStream(ctx context.Context, destination io.Writer, source io.Reader, size int64, progress Progress) error {
-	const bufferBytes = 64 * 1024
-	buffer := make([]byte, bufferBytes)
+	return copyStreamBuffer(ctx, destination, source, size, progress, make([]byte, streamBufferBytes))
+}
+
+func copyStreamBuffer(ctx context.Context, destination io.Writer, source io.Reader, size int64, progress Progress, buffer []byte) error {
+	if len(buffer) == 0 {
+		return errors.New("stream buffer cannot be empty")
+	}
 	remaining := size
 	completed := int64(0)
 	if progress != nil {

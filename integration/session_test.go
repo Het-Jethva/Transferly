@@ -261,6 +261,34 @@ func TestAcceptedFileIsPublishedWithoutChangingTheSource(t *testing.T) {
 	}
 }
 
+func TestAdaptiveBatchProgressReportsBoundedConcurrentFilesAndFinalItems(t *testing.T) {
+	sender := startPeer(t, slowIdleExecutable)
+	receiver := startPeer(t, transferlyExecutable)
+	verifyPeers(t, sender, receiver)
+
+	folder := filepath.Join(t.TempDir(), "concurrent-batch")
+	if err := os.Mkdir(folder, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for index := 1; index <= 5; index++ {
+		path := filepath.Join(folder, fmt.Sprintf("file-%d.bin", index))
+		if err := os.WriteFile(path, make([]byte, 256*1024), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sender.send(t, "send "+folder)
+	receiver.waitFor(t, "Transfer Offer: 1 top-level roots, 5 files")
+	receiver.send(t, "accept")
+	sender.waitFor(t, "Adaptive scheduling: up to 4 concurrent file streams")
+	sender.waitFor(t, "Active files: 4 | Completed: 0/5")
+	sender.waitFor(t, "Aggregate:")
+	sender.waitFor(t, "Rate:")
+	sender.waitFor(t, "ETA:")
+	sender.waitFor(t, "Item succeeded: concurrent-batch/file-1.bin")
+	sender.waitFor(t, "Transfer complete: 5 files, 1 folders")
+}
+
 func TestLargeFileStreamsToCompletionWithConstrainedProcessMemory(t *testing.T) {
 	sender := startPeer(t, transferlyExecutable)
 	receiver := startPeer(t, transferlyExecutable)
@@ -1097,8 +1125,8 @@ func TestIncompatibleProtocolMajorIsRejectedBeforeVerification(t *testing.T) {
 	second := startPeer(t, incompatibleTransferlyExecutable)
 
 	first.send(t, "connect "+second.endpoint)
-	first.waitFor(t, "Incompatible wire protocol: local 2.0, Peer 1.0")
-	second.waitFor(t, "Incompatible wire protocol: local 1.0, Peer 2.0")
+	first.waitFor(t, "Incompatible wire protocol: local 3.0, Peer 1.0")
+	second.waitFor(t, "Incompatible wire protocol: local 1.0, Peer 3.0")
 
 	if first.contains("Verification code:") || second.contains("Verification code:") {
 		t.Fatal("an incompatible connection reached human verification")
@@ -1276,7 +1304,7 @@ func openHostileSession(t *testing.T, receiver *peerProcess) *session.Session {
 	openErrors := make(chan error, 1)
 	codes := make(chan string, 1)
 	go func() {
-		secured, openError := session.Open(context.Background(), connection, session.Outbound, session.Version{Major: 2}, func(_ context.Context, code string) (bool, error) {
+		secured, openError := session.Open(context.Background(), connection, session.Outbound, session.Version{Major: 3}, func(_ context.Context, code string) (bool, error) {
 			codes <- code
 			return true, nil
 		})
