@@ -1,8 +1,11 @@
 package terminal
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -23,6 +26,7 @@ type manifestEntry struct {
 	Modified   time.Time
 	ReadOnly   bool
 	Hidden     bool
+	Digest     string
 }
 
 type manifestOmission struct {
@@ -97,9 +101,16 @@ func walkManifestRoot(manifest *offerManifest, sourcePath, relativePath string) 
 		if openError != nil {
 			return addManifestOmission(manifest, relativePath, "unreadable")
 		}
-		_ = probe.Close()
+		hash := sha256.New()
+		_, copyError := io.Copy(hash, probe)
+		after, statError := probe.Stat()
+		closeError := probe.Close()
+		if copyError != nil || statError != nil || closeError != nil || after.Size() != info.Size() || !after.ModTime().Equal(info.ModTime()) {
+			return addManifestOmission(manifest, relativePath, "changed or could not be read while preparing the offer")
+		}
 		entry.Kind = manifestFile
 		entry.Size = info.Size()
+		entry.Digest = hex.EncodeToString(hash.Sum(nil))
 		if entry.Size > int64(^uint64(0)>>1)-manifest.TotalBytes {
 			return errors.New("Transfer Offer total byte count overflows the protocol")
 		}

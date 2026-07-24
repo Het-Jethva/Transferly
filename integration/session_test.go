@@ -183,7 +183,7 @@ func TestHostilePeerManifestPathsEndTheSessionBeforeContentIsAccepted(t *testing
 			if err := hostile.Send(session.Message{Type: "offer", OfferID: strings.Repeat("a", 32), RootCount: 1, FileCount: 1, TotalBytes: 1}); err != nil {
 				t.Fatal(err)
 			}
-			if err := hostile.Send(session.Message{Type: "manifest-entry", OfferID: strings.Repeat("a", 32), Path: path, Kind: "file", Size: 1}); err != nil {
+			if err := hostile.Send(session.Message{Type: "manifest-entry", OfferID: strings.Repeat("a", 32), Path: path, Kind: "file", Size: 1, Digest: strings.Repeat("0", 64)}); err != nil {
 				t.Fatal(err)
 			}
 			receiver.waitFor(t, reason)
@@ -207,7 +207,7 @@ func TestHostilePeerUnicodeCaseAliasesAreRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, path := range []string{"Résumé.txt", "RE\u0301SUME\u0301.TXT"} {
-		if err := hostile.Send(session.Message{Type: "manifest-entry", OfferID: offerID, Path: path, Kind: "file", Size: 1}); err != nil {
+		if err := hostile.Send(session.Message{Type: "manifest-entry", OfferID: offerID, Path: path, Kind: "file", Size: 1, Digest: strings.Repeat("0", 64)}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -295,6 +295,132 @@ func TestLargeFileStreamsToCompletionWithConstrainedProcessMemory(t *testing.T) 
 	if fileSHA256(t, sourcePath) != fileSHA256(t, destination) {
 		t.Fatal("large streamed destination digest does not match the source")
 	}
+}
+
+func TestSourceDigestChangeProducesAnExactPartialCompletionAndContinues(t *testing.T) {
+	sender := startPeer(t, slowIdleExecutable)
+	receiver := startPeer(t, transferlyExecutable)
+	verifyPeers(t, sender, receiver)
+
+	folder := filepath.Join(t.TempDir(), "partial-batch")
+	if err := os.Mkdir(folder, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	first := filepath.Join(folder, "a-first.bin")
+	changed := filepath.Join(folder, "b-changed.txt")
+	last := filepath.Join(folder, "c-last.txt")
+	if err := os.WriteFile(first, make([]byte, 2*1024*1024), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(changed, []byte("before"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(last, []byte("independent success"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	originalInfo, err := os.Stat(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sender.send(t, "send "+folder)
+	receiver.waitFor(t, "Transfer Offer: 1 top-level roots, 3 files")
+	receiver.send(t, "accept")
+	receiver.waitFor(t, "Receiving partial-batch/a-first.bin: 0/2097152 bytes")
+	if err := os.WriteFile(changed, []byte("AFTER!"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(changed, originalInfo.ModTime(), originalInfo.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+
+	sender.waitFor(t, "Transfer failed for partial-batch/b-changed.txt: source changed after approval")
+	sender.waitFor(t, "Transfer Offer partially completed: 2 of 3 files succeeded; 1 failed.")
+	receiver.waitFor(t, "Transfer Offer partially completed: 2 of 3 files succeeded; 1 failed.")
+
+	destination := filepath.Join(receiver.homeDir, "Downloads", "partial-batch")
+	assertFileContent(t, filepath.Join(destination, "a-first.bin"), string(make([]byte, 2*1024*1024)))
+	assertFileContent(t, filepath.Join(destination, "c-last.txt"), "independent success")
+	if _, err := os.Stat(filepath.Join(destination, "b-changed.txt")); !os.IsNotExist(err) {
+		t.Fatalf("changed source was published as valid: %v", err)
+	}
+}
+
+func TestSourceThatVanishesAfterApprovalFailsWithoutStoppingOtherFiles(t *testing.T) {
+	sender := startPeer(t, slowIdleExecutable)
+	receiver := startPeer(t, transferlyExecutable)
+	verifyPeers(t, sender, receiver)
+
+	folder := filepath.Join(t.TempDir(), "vanished-source")
+	if err := os.Mkdir(folder, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	first := filepath.Join(folder, "a-first.bin")
+	vanished := filepath.Join(folder, "b-vanished.txt")
+	last := filepath.Join(folder, "c-last.txt")
+	if err := os.WriteFile(first, make([]byte, 2*1024*1024), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(vanished, []byte("vanish after approval"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(last, []byte("still succeeds"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sender.send(t, "send "+folder)
+	receiver.waitFor(t, "Transfer Offer: 1 top-level roots, 3 files")
+	receiver.send(t, "accept")
+	receiver.waitFor(t, "Receiving vanished-source/a-first.bin: 0/2097152 bytes")
+	if err := os.Remove(vanished); err != nil {
+		t.Fatal(err)
+	}
+
+	sender.waitFor(t, "Transfer failed for vanished-source/b-vanished.txt: source could not be opened")
+	sender.waitFor(t, "Transfer Offer partially completed: 2 of 3 files succeeded; 1 failed.")
+	receiver.waitFor(t, "Transfer Offer partially completed: 2 of 3 files succeeded; 1 failed.")
+	destination := filepath.Join(receiver.homeDir, "Downloads", "vanished-source")
+	assertFileContent(t, filepath.Join(destination, "c-last.txt"), "still succeeds")
+	if _, err := os.Stat(filepath.Join(destination, "b-vanished.txt")); !os.IsNotExist(err) {
+		t.Fatalf("vanished source was published: %v", err)
+	}
+}
+
+func TestDestinationWriteFailurePreservesCompletedFilesAndContinues(t *testing.T) {
+	sender := startPeer(t, slowIdleExecutable)
+	receiver := startPeer(t, transferlyExecutable)
+	verifyPeers(t, sender, receiver)
+
+	folder := filepath.Join(t.TempDir(), "write-failure")
+	if err := os.Mkdir(folder, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fixtures := map[string][]byte{
+		"a-first.txt": []byte("first survives"),
+		"b-race.bin":  make([]byte, 2*1024*1024),
+		"c-last.txt":  []byte("last survives"),
+	}
+	for name, content := range fixtures {
+		if err := os.WriteFile(filepath.Join(folder, name), content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sender.send(t, "send "+folder)
+	receiver.waitFor(t, "Transfer Offer: 1 top-level roots, 3 files")
+	receiver.send(t, "accept")
+	receiver.waitFor(t, "Receiving write-failure/b-race.bin: 0/2097152 bytes")
+	destination := filepath.Join(receiver.homeDir, "Downloads", "write-failure")
+	if err := os.WriteFile(filepath.Join(destination, "b-race.bin"), []byte("appeared after approval"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sender.waitFor(t, "Transfer failed for write-failure/b-race.bin: destination write failed")
+	sender.waitFor(t, "Transfer Offer partially completed: 2 of 3 files succeeded; 1 failed.")
+	receiver.waitFor(t, "Transfer Offer partially completed: 2 of 3 files succeeded; 1 failed.")
+	assertFileContent(t, filepath.Join(destination, "a-first.txt"), "first survives")
+	assertFileContent(t, filepath.Join(destination, "b-race.bin"), "appeared after approval")
+	assertFileContent(t, filepath.Join(destination, "c-last.txt"), "last survives")
 }
 
 func TestDigestMismatchRemovesIncompleteContent(t *testing.T) {
@@ -758,6 +884,128 @@ func TestTransferOfferQueueHasABoundedCapacity(t *testing.T) {
 	sender.waitFor(t, "Transfer Offer queue is full")
 }
 
+func TestEitherPeerCanCancelTheActiveOfferAndQueuedWorkContinues(t *testing.T) {
+	for _, cancelingPeer := range []string{"sender", "receiver"} {
+		t.Run(cancelingPeer, func(t *testing.T) {
+			sender := startPeer(t, slowIdleExecutable)
+			receiver := startPeer(t, transferlyExecutable)
+			verifyPeers(t, sender, receiver)
+
+			directory := t.TempDir()
+			active := filepath.Join(directory, "cancel-me.bin")
+			queued := filepath.Join(directory, "keep-queued.txt")
+			if err := os.WriteFile(active, make([]byte, 2*1024*1024), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(queued, []byte("queued work remains"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			sender.send(t, "send "+active)
+			receiver.waitFor(t, "Transfer Offer: cancel-me.bin")
+			sender.send(t, "send "+queued)
+			sender.waitFor(t, "Transfer Offer queued: keep-queued.txt")
+			receiver.send(t, "accept")
+			receiver.waitFor(t, "Receiving cancel-me.bin: 0/2097152 bytes")
+			if cancelingPeer == "sender" {
+				sender.send(t, "cancel")
+			} else {
+				receiver.send(t, "cancel")
+			}
+			sender.waitFor(t, "Transfer Offer canceled")
+			receiver.waitFor(t, "Transfer Offer canceled")
+			receiver.waitFor(t, "Transfer Offer: keep-queued.txt")
+			receiver.send(t, "accept")
+			receiver.waitFor(t, "Received keep-queued.txt")
+			sender.waitFor(t, "Transfer complete: keep-queued.txt")
+
+			downloads := filepath.Join(receiver.homeDir, "Downloads")
+			if _, err := os.Stat(filepath.Join(downloads, "cancel-me.bin")); !os.IsNotExist(err) {
+				t.Fatalf("canceled file was published: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(downloads, ".transferly-staging")); !os.IsNotExist(err) {
+				t.Fatalf("canceled temporary content was retained: %v", err)
+			}
+			assertFileContent(t, filepath.Join(downloads, "keep-queued.txt"), "queued work remains")
+		})
+	}
+}
+
+func TestNetworkLossCleansIncompleteDataAndRetainsVerifiedFiles(t *testing.T) {
+	sender := startPeer(t, slowIdleExecutable)
+	receiver := startPeer(t, transferlyExecutable)
+	verifyPeers(t, sender, receiver)
+
+	folder := filepath.Join(t.TempDir(), "lost-connection")
+	if err := os.Mkdir(folder, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(folder, "a-complete.txt"), []byte("verified before loss"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(folder, "b-incomplete.bin"), make([]byte, 4*1024*1024), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sender.send(t, "send "+folder)
+	receiver.waitFor(t, "Transfer Offer: 1 top-level roots, 2 files")
+	receiver.send(t, "accept")
+	receiver.waitFor(t, "Received lost-connection/a-complete.txt")
+	receiver.waitFor(t, "Receiving lost-connection/b-incomplete.bin: 0/4194304 bytes")
+	sender.kill(t)
+	receiver.waitFor(t, "Transfer Session ended")
+
+	destination := filepath.Join(receiver.homeDir, "Downloads", "lost-connection")
+	assertFileContent(t, filepath.Join(destination, "a-complete.txt"), "verified before loss")
+	if _, err := os.Stat(filepath.Join(destination, "b-incomplete.bin")); !os.IsNotExist(err) {
+		t.Fatalf("incomplete file was published after network loss: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(receiver.homeDir, "Downloads", ".transferly-staging")); !os.IsNotExist(err) {
+		t.Fatalf("incomplete staging survived network loss: %v", err)
+	}
+
+	replacement := startPeer(t, transferlyExecutable)
+	verifyPeers(t, replacement, receiver)
+}
+
+func TestCrashStagingIsDetectedAndSafelyCleanedBeforeAFreshSessionRestarts(t *testing.T) {
+	sender := startPeer(t, slowIdleExecutable)
+	receiverHome := t.TempDir()
+	receiver := startPeerWithHome(t, transferlyExecutable, receiverHome)
+	verifyPeers(t, sender, receiver)
+
+	sourcePath := filepath.Join(t.TempDir(), "interrupted.bin")
+	if err := os.WriteFile(sourcePath, make([]byte, 4*1024*1024), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sender.send(t, "send "+sourcePath)
+	receiver.waitFor(t, "Transfer Offer: interrupted.bin")
+	receiver.send(t, "accept")
+	receiver.waitFor(t, "Receiving interrupted.bin: 0/4194304 bytes")
+	receiver.kill(t)
+	sender.waitFor(t, "Transfer Session ended")
+
+	staging := filepath.Join(receiverHome, "Downloads", ".transferly-staging")
+	if entries, err := os.ReadDir(staging); err != nil || len(entries) == 0 {
+		t.Fatalf("abrupt process death did not leave detectable staging: entries=%v err=%v", entries, err)
+	}
+
+	replacement := startPeerWithHome(t, transferlyExecutable, receiverHome)
+	verifyPeers(t, sender, replacement)
+	fresh := filepath.Join(t.TempDir(), "fresh-restart.txt")
+	if err := os.WriteFile(fresh, []byte("fresh verified session"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sender.send(t, "send "+fresh)
+	replacement.waitFor(t, "Stale Transferly staging data detected")
+	replacement.send(t, "accept")
+	replacement.waitFor(t, "stale Transferly staging data must be removed")
+	replacement.send(t, "cleanup-staging")
+	replacement.waitFor(t, "Stale Transferly staging data removed. It was not used as resume state.")
+	replacement.send(t, "accept")
+	replacement.waitFor(t, "Received fresh-restart.txt")
+	assertFileContent(t, filepath.Join(receiverHome, "Downloads", "fresh-restart.txt"), "fresh verified session")
+}
+
 func TestDisconnectDuringOfferAcceptanceCleansStaging(t *testing.T) {
 	sender := startPeer(t, slowIdleExecutable)
 	receiver := startPeer(t, transferlyExecutable)
@@ -1105,10 +1353,19 @@ func startPeer(t *testing.T, executable string) *peerProcess {
 	return startPeerAt(t, executable, "127.0.0.1:0")
 }
 
+func startPeerWithHome(t *testing.T, executable, homeDir string) *peerProcess {
+	t.Helper()
+	return startPeerAtWithHome(t, executable, "127.0.0.1:0", homeDir)
+}
+
 func startPeerAt(t *testing.T, executable, listenAddress string) *peerProcess {
 	t.Helper()
+	return startPeerAtWithHome(t, executable, listenAddress, t.TempDir())
+}
+
+func startPeerAtWithHome(t *testing.T, executable, listenAddress, homeDir string) *peerProcess {
+	t.Helper()
 	workDir := t.TempDir()
-	homeDir := t.TempDir()
 	command := exec.Command(executable, "--listen", listenAddress)
 	command.Dir = workDir
 	command.Env = append(os.Environ(), "HOME="+homeDir, "USERPROFILE="+homeDir, "GOMEMLIMIT=24MiB")
@@ -1275,6 +1532,19 @@ func (p *peerProcess) count(text string) int {
 
 func (p *peerProcess) matchCount(pattern *regexp.Regexp) int {
 	return len(pattern.FindAllString(p.snapshot(), -1))
+}
+
+func (p *peerProcess) kill(t *testing.T) {
+	t.Helper()
+	if p.command.Process == nil || p.command.ProcessState != nil {
+		return
+	}
+	if err := p.command.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.command.Wait(); err == nil {
+		t.Fatal("abruptly killed Transferly exited successfully")
+	}
 }
 
 func (p *peerProcess) stop(t *testing.T) {

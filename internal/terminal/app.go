@@ -25,12 +25,13 @@ import (
 )
 
 const (
-	connectTimeout     = 4 * time.Second
-	defaultIdleWarning = 14 * time.Minute
-	defaultIdleTimeout = 15 * time.Minute
-	maxQueuedOffers    = 64
-	messageActivity    = "activity"
-	messageKeepAlive   = "keepalive"
+	connectTimeout      = 4 * time.Second
+	defaultIdleWarning  = 14 * time.Minute
+	defaultIdleTimeout  = 15 * time.Minute
+	maxQueuedOffers     = 64
+	messageActivity     = "activity"
+	messageKeepAlive    = "keepalive"
+	reasonOfferCanceled = "Transfer Offer canceled"
 )
 
 // Config contains process-lifetime settings. It is intentionally not persisted.
@@ -93,24 +94,30 @@ type queuedOffer struct {
 }
 
 type incomingOffer struct {
-	id            string
-	manifest      offerManifest
-	destination   string
-	actions       chan offerAction
-	waiting       bool
-	accepted      bool
-	collecting    bool
-	stagingPath   string
-	stagingFile   *os.File
-	activeEntry   *manifestEntry
-	finalPaths    map[string]string
-	completedFile int
-	rootCount     int
-	reviewDone    chan struct{}
+	id                 string
+	canceled           bool
+	manifest           offerManifest
+	destination        string
+	actions            chan offerAction
+	waiting            bool
+	accepted           bool
+	collecting         bool
+	stagingPath        string
+	stagingFile        *os.File
+	activeEntry        *manifestEntry
+	finalPaths         map[string]string
+	createdDirectories []string
+	staleStaging       bool
+	completedFile      int
+	failedFile         int
+	fileOutcomes       map[string]struct{}
+	rootCount          int
+	reviewDone         chan struct{}
 }
 
 type outgoingOffer struct {
 	id        string
+	canceled  bool
 	manifest  offerManifest
 	decision  chan session.Message
 	result    chan session.Message
@@ -224,6 +231,9 @@ func (a *App) Run(input io.Reader) error {
 				return nil
 			}
 		case <-interrupts:
+			if a.cancelActiveOffer() {
+				continue
+			}
 			a.line("Interrupted; disconnecting and exiting.")
 			a.shutdown()
 			return nil
@@ -270,6 +280,14 @@ func (a *App) handleLine(line string) bool {
 			return false
 		}
 		a.sendPaths(paths)
+	case "cancel":
+		if argument != "" {
+			a.line("Usage: cancel")
+			return false
+		}
+		if !a.cancelActiveOffer() {
+			a.line("There is no active Transfer Offer to cancel.")
+		}
 	case "disconnect":
 		if argument != "" {
 			a.line("Usage: disconnect")
@@ -286,7 +304,7 @@ func (a *App) handleLine(line string) bool {
 		return true
 	case "help":
 		a.printCommands()
-	case "accept", "reject", "destination", "details":
+	case "accept", "reject", "destination", "details", "cleanup-staging":
 		a.line("There is no Transfer Offer awaiting approval.")
 	default:
 		a.line("Unknown command %q. Type help for available commands.", command)
@@ -314,7 +332,7 @@ func onePathArgument(argument string) (string, bool) {
 }
 
 func (a *App) printCommands() {
-	a.line("Commands: connect <peer-number|IPv4:port>, send <path>..., keep-alive, disconnect, quit")
+	a.line("Commands: connect <peer-number|IPv4:port>, send <path>..., cancel, keep-alive, disconnect, quit")
 }
 
 func (a *App) connectTarget(target string) {
@@ -427,6 +445,12 @@ func (a *App) answerPendingOffer(line string) bool {
 			return true
 		}
 		action.kind = "details"
+	case "cleanup-staging":
+		if argument != "" {
+			a.line("Usage: cleanup-staging")
+			return true
+		}
+		action.kind = "cleanup-staging"
 	case "destination":
 		path, ok := onePathArgument(argument)
 		if !ok {
@@ -438,7 +462,7 @@ func (a *App) answerPendingOffer(line string) bool {
 	case "send", "help", "keep-alive", "disconnect", "quit", "exit":
 		return false
 	default:
-		a.line("Choose accept, reject, destination <path>, or details for this Transfer Offer.")
+		a.line("Choose accept, reject, destination <path>, details, or cleanup-staging for this Transfer Offer.")
 		return true
 	}
 
@@ -642,6 +666,10 @@ func (a *App) serveSession(current *attempt) error {
 			if err := a.receiveContent(current, message); err != nil {
 				return err
 			}
+		case "file-failed":
+			if err := a.receiveFileFailure(current, message); err != nil {
+				return err
+			}
 		case "result":
 			if !a.routeOutgoing(current, message, false) {
 				return errors.New("received a result for an unknown Transfer Offer")
@@ -652,6 +680,10 @@ func (a *App) serveSession(current *attempt) error {
 			}
 		case "abort":
 			a.abortIncoming(current, message)
+		case "cancel":
+			if err := a.handlePeerCancellation(current, message); err != nil {
+				return err
+			}
 		case messageActivity:
 			if a.config.ControllableTime {
 				a.line("Test clock: Peer terminal activity observed.")
@@ -816,7 +848,7 @@ func sendManifest(secured *session.Session, outgoing *outgoingOffer) error {
 		return err
 	}
 	for _, entry := range manifest.Entries {
-		if err := secured.Send(session.Message{Type: "manifest-entry", OfferID: outgoing.id, Path: entry.Path, Kind: entry.Kind, Size: entry.Size, Modified: entry.Modified.UnixNano(), ReadOnly: entry.ReadOnly, Hidden: entry.Hidden}); err != nil {
+		if err := secured.Send(session.Message{Type: "manifest-entry", OfferID: outgoing.id, Path: entry.Path, Kind: entry.Kind, Size: entry.Size, Modified: entry.Modified.UnixNano(), ReadOnly: entry.ReadOnly, Hidden: entry.Hidden, Digest: entry.Digest}); err != nil {
 			return err
 		}
 	}
@@ -855,15 +887,30 @@ func (a *App) runOutgoing(current *attempt, outgoing *outgoingOffer) {
 	}
 
 	a.startTransfer(current)
+	succeeded, failed := 0, 0
 	for index := range manifest.Entries {
 		entry := &manifest.Entries[index]
 		if entry.Kind != manifestFile {
 			continue
 		}
-		if err := a.sendManifestFile(current, outgoing, entry); err != nil {
-			_ = current.secure.Send(session.Message{Type: "abort", OfferID: outgoing.id, Path: entry.Path, Reason: err.Error()})
-			a.failOutgoing(current, outgoing, "Transfer failed for %s: %v", entry.Path, err)
+		a.mu.Lock()
+		canceled := outgoing.canceled
+		a.mu.Unlock()
+		if canceled {
+			select {
+			case <-outgoing.result:
+			case <-current.context.Done():
+				return
+			}
+			a.clearOutgoing(current, outgoing)
+			a.line("Transfer Offer canceled; incomplete content was removed and completed files were retained.")
 			return
+		}
+		if err := a.sendManifestFile(current, outgoing, entry); err != nil {
+			if sendError := current.secure.Send(session.Message{Type: "file-failed", OfferID: outgoing.id, Path: entry.Path, Reason: err.Error()}); sendError != nil {
+				a.failOutgoing(current, outgoing, "Transfer failed for %s: %v", entry.Path, sendError)
+				return
+			}
 		}
 		var result session.Message
 		select {
@@ -872,9 +919,16 @@ func (a *App) runOutgoing(current *attempt, outgoing *outgoingOffer) {
 			return
 		}
 		if result.Success == nil || !*result.Success {
-			a.failOutgoing(current, outgoing, "Transfer failed for %s: %s.", entry.Path, result.Reason)
-			return
+			if result.Reason == reasonOfferCanceled {
+				a.clearOutgoing(current, outgoing)
+				a.line("Transfer Offer canceled; incomplete content was removed and completed files were retained.")
+				return
+			}
+			failed++
+			a.line("Transfer failed for %s: %s.", entry.Path, result.Reason)
+			continue
 		}
+		succeeded++
 	}
 	if err := current.secure.Send(session.Message{Type: "batch-complete", OfferID: outgoing.id}); err != nil {
 		a.failOutgoing(current, outgoing, "Could not complete Transfer Offer: %v", err)
@@ -887,6 +941,10 @@ func (a *App) runOutgoing(current *attempt, outgoing *outgoingOffer) {
 		return
 	}
 	a.clearOutgoing(current, outgoing)
+	if failed > 0 {
+		a.line("Transfer Offer partially completed: %d of %d files succeeded; %d failed.", succeeded, manifest.FileCount, failed)
+		return
+	}
 	if result.Success == nil || !*result.Success {
 		a.line("Transfer Offer failed: %s.", result.Reason)
 		return
@@ -906,7 +964,7 @@ func (a *App) sendManifestFile(current *attempt, outgoing *outgoingOffer, entry 
 	defer source.Close()
 	before, err := source.Stat()
 	if err != nil || before.Size() != entry.Size || !before.ModTime().Equal(entry.Modified) {
-		return errors.New("source changed after the offer was created")
+		return errors.New("source changed after approval")
 	}
 	progress := a.progress("Sending "+entry.Path, entry.Size)
 	var sourceReader io.Reader = source
@@ -915,13 +973,26 @@ func (a *App) sendManifestFile(current *attempt, outgoing *outgoingOffer, entry 
 	}
 	_, err = current.secure.SendStream(current.context, session.Message{Type: "content", OfferID: outgoing.id, Path: entry.Path, Size: entry.Size}, sourceReader, entry.Size, progress, func(digest string) (session.Message, error) {
 		after, statError := source.Stat()
+		completion := session.Message{Type: "complete", OfferID: outgoing.id, Path: entry.Path, Size: entry.Size, Digest: digest}
+		failed := false
 		if statError != nil || after.Size() != entry.Size || !after.ModTime().Equal(entry.Modified) {
-			return session.Message{}, errors.New("source changed while it was being read")
+			completion.Success = &failed
+			completion.Reason = "source changed after approval"
+		}
+		if !strings.EqualFold(digest, entry.Digest) {
+			completion.Success = &failed
+			completion.Reason = "source changed after approval"
 		}
 		if a.config.CorruptDigest {
-			digest = corruptSHA256(digest)
+			completion.Digest = corruptSHA256(digest)
 		}
-		return session.Message{Type: "complete", OfferID: outgoing.id, Path: entry.Path, Size: entry.Size, Digest: digest}, nil
+		a.mu.Lock()
+		if outgoing.canceled {
+			completion.Success = &failed
+			completion.Reason = reasonOfferCanceled
+		}
+		a.mu.Unlock()
+		return completion, nil
 	})
 	if err != nil {
 		return errors.New("source changed or could not be read completely")
@@ -1029,7 +1100,10 @@ func (a *App) handleIncomingManifest(current *attempt, message session.Message) 
 		if (message.Kind != manifestFile && message.Kind != manifestFolder) || message.Size < 0 || (message.Kind == manifestFolder && message.Size != 0) {
 			return errors.New("Peer sent an invalid manifest entry")
 		}
-		incoming.manifest.Entries = append(incoming.manifest.Entries, manifestEntry{Path: message.Path, Kind: message.Kind, Size: message.Size, Modified: time.Unix(0, message.Modified), ReadOnly: message.ReadOnly, Hidden: message.Hidden})
+		if (message.Kind == manifestFile && (len(message.Digest) != 64 || !isHexDigest(message.Digest))) || (message.Kind == manifestFolder && message.Digest != "") {
+			return errors.New("Peer sent an invalid manifest digest")
+		}
+		incoming.manifest.Entries = append(incoming.manifest.Entries, manifestEntry{Path: message.Path, Kind: message.Kind, Size: message.Size, Modified: time.Unix(0, message.Modified), ReadOnly: message.ReadOnly, Hidden: message.Hidden, Digest: strings.ToLower(message.Digest)})
 	case "manifest-omission":
 		if len(incoming.manifest.Omissions) >= maxManifestOmissions {
 			return errors.New("Peer sent too many manifest omissions")
@@ -1136,6 +1210,17 @@ func (a *App) reviewIncomingOffer(current *attempt, incoming *incomingOffer) err
 			switch action.kind {
 			case "details":
 				a.showManifestDetails(incoming)
+			case "cleanup-staging":
+				if !incoming.staleStaging {
+					a.line("There is no stale Transferly staging data at this destination.")
+					continue
+				}
+				if err := cleanupStaleStaging(incoming.destination); err != nil {
+					a.line("Could not remove stale Transferly staging data: %v", err)
+					continue
+				}
+				incoming.staleStaging = false
+				a.line("Stale Transferly staging data removed. It was not used as resume state.")
 			case "destination":
 				destination, err := filepath.Abs(action.destination)
 				if err != nil {
@@ -1191,6 +1276,10 @@ func resolveIncomingPaths(incoming *incomingOffer) error {
 		return err
 	}
 	incoming.destination = destination
+	incoming.staleStaging, err = hasStaleStaging(destination)
+	if err != nil {
+		return fmt.Errorf("inspect Transferly staging data: %w", err)
+	}
 	incoming.finalPaths = make(map[string]string)
 	for _, root := range incoming.manifest.Roots {
 		path, err := resolveFinalPathWithReservations(destination, root, reserved)
@@ -1219,6 +1308,9 @@ func (a *App) showIncoming(incoming *incomingOffer) {
 	}
 	if len(manifest.Omissions) > 0 {
 		a.line("Omissions: %d unsupported, unreadable, or vanished entries (type details to review)", len(manifest.Omissions))
+	}
+	if incoming.staleStaging {
+		a.line("Stale Transferly staging data detected at this destination. It is not resumable; type cleanup-staging to remove it safely before accepting.")
 	}
 	if manifest.FileCount == 1 && manifest.FolderCount == 0 {
 		a.line("Choose accept, reject, or destination <path>.")
@@ -1256,6 +1348,9 @@ func (a *App) showManifestDetails(incoming *incomingOffer) {
 }
 
 func prepareIncoming(incoming *incomingOffer) error {
+	if incoming.staleStaging {
+		return errors.New("stale Transferly staging data must be removed with cleanup-staging or a different destination selected")
+	}
 	if err := rejectExistingReparseComponents(incoming.destination); err != nil {
 		return fmt.Errorf("destination is unsafe: %w", err)
 	}
@@ -1275,12 +1370,8 @@ func prepareIncoming(incoming *incomingOffer) error {
 		return fmt.Errorf("insufficient disk space: need %d bytes, only %d bytes are available", incoming.manifest.TotalBytes, available)
 	}
 
-	createdRoots := make([]string, 0, len(incoming.manifest.Roots))
-	rollbackRoots := func() {
-		for index := len(createdRoots) - 1; index >= 0; index-- {
-			_ = os.Remove(createdRoots[index]) // Remove only empty paths we created; never remove user content.
-		}
-	}
+	incoming.createdDirectories = nil
+	rollbackRoots := func() { removeCreatedDirectories(incoming) }
 	for _, root := range incoming.manifest.Roots {
 		var rootEntry *manifestEntry
 		for index := range incoming.manifest.Entries {
@@ -1307,7 +1398,7 @@ func prepareIncoming(incoming *incomingOffer) error {
 				rollbackRoots()
 				return fmt.Errorf("final path %s became unavailable after approval: %w", finalPath, err)
 			}
-			createdRoots = append(createdRoots, finalPath)
+			incoming.createdDirectories = append(incoming.createdDirectories, finalPath)
 		}
 	}
 	folders := make([]manifestEntry, 0, incoming.manifest.FolderCount)
@@ -1329,6 +1420,7 @@ func prepareIncoming(incoming *incomingOffer) error {
 			rollbackRoots()
 			return fmt.Errorf("create manifest folder %s: %w", entry.Path, err)
 		}
+		incoming.createdDirectories = append(incoming.createdDirectories, path)
 	}
 	staging := filepath.Join(incoming.destination, ".transferly-staging")
 	if err := ensurePathBeneath(incoming.destination, staging); err != nil {
@@ -1372,31 +1464,49 @@ func (a *App) receiveContent(current *attempt, message session.Message) error {
 	if entry == nil || entry.Kind != manifestFile || entry.Size != message.Size {
 		return errors.New("Peer sent content for an unknown manifest file")
 	}
+	if incoming.fileOutcomes == nil {
+		incoming.fileOutcomes = make(map[string]struct{}, incoming.manifest.FileCount)
+	}
+	if _, completed := incoming.fileOutcomes[manifestPathKey(entry.Path)]; completed {
+		return errors.New("Peer repeated an outcome for a manifest file")
+	}
 	stagingDirectory := filepath.Join(incoming.destination, ".transferly-staging")
 	if err := rejectReparseAncestors(incoming.destination, stagingDirectory); err != nil {
 		return fmt.Errorf("staging area became unsafe: %w", err)
 	}
-	file, err := os.CreateTemp(stagingDirectory, "incoming-*.part")
-	if err != nil {
-		return err
+	if err := os.MkdirAll(stagingDirectory, 0o700); err != nil {
+		return fmt.Errorf("recreate staging area: %w", err)
 	}
-	incoming.stagingFile, incoming.stagingPath, incoming.activeEntry = file, file.Name(), entry
+	if err := rejectReparsePoint(stagingDirectory); err != nil {
+		return fmt.Errorf("staging area became unsafe: %w", err)
+	}
+	file, createError := os.CreateTemp(stagingDirectory, "incoming-*.part")
+	var destination io.Writer = io.Discard
+	var writeFailure error
+	if createError != nil {
+		writeFailure = fmt.Errorf("create temporary file: %w", createError)
+	} else {
+		incoming.stagingFile, incoming.stagingPath, incoming.activeEntry = file, file.Name(), entry
+		destination = &recoverableWriter{destination: file}
+	}
 	progress := a.progress("Receiving "+entry.Path, entry.Size)
-	digest, err := current.secure.ReceiveStream(current.context, file, entry.Size, progress)
+	digest, err := current.secure.ReceiveStream(current.context, destination, entry.Size, progress)
 	if err != nil {
 		a.cleanupIncoming(current)
 		return fmt.Errorf("receive %s: %w", entry.Path, err)
 	}
-	if err := file.Sync(); err != nil {
-		a.cleanupIncoming(current)
-		return fmt.Errorf("flush temporary file: %w", err)
+	if writer, ok := destination.(*recoverableWriter); ok && writer.failure != nil {
+		writeFailure = writer.failure
 	}
-	if err := file.Close(); err != nil {
+	if file != nil {
+		if err := file.Sync(); err != nil && writeFailure == nil {
+			writeFailure = fmt.Errorf("flush temporary file: %w", err)
+		}
+		if err := file.Close(); err != nil && writeFailure == nil {
+			writeFailure = fmt.Errorf("close temporary file: %w", err)
+		}
 		incoming.stagingFile = nil
-		a.cleanupIncoming(current)
-		return fmt.Errorf("close temporary file: %w", err)
 	}
-	incoming.stagingFile = nil
 	completion, err := current.secure.Receive()
 	if err != nil {
 		a.cleanupIncoming(current)
@@ -1406,13 +1516,26 @@ func (a *App) receiveContent(current *attempt, message session.Message) error {
 		a.cleanupIncoming(current)
 		return errors.New("Peer sent an invalid file completion frame")
 	}
-	if len(completion.Digest) != 64 || !strings.EqualFold(completion.Digest, digest) {
+	a.mu.Lock()
+	canceled := incoming.canceled || (completion.Success != nil && !*completion.Success && completion.Reason == reasonOfferCanceled)
+	a.mu.Unlock()
+	if canceled {
 		a.removeIncomingFiles(incoming)
 		success := false
-		_ = current.secure.Send(session.Message{Type: "result", OfferID: incoming.id, Path: entry.Path, Success: &success, Reason: "size or SHA-256 integrity check failed"})
+		_ = current.secure.Send(session.Message{Type: "result", OfferID: incoming.id, Path: entry.Path, Success: &success, Reason: reasonOfferCanceled})
 		a.clearIncoming(current, incoming)
-		a.line("Transfer failed for %s: size or SHA-256 integrity check failed; incomplete content was removed.", entry.Path)
+		a.line("Transfer Offer canceled; incomplete content was removed and completed files were retained.")
 		return nil
+	}
+	if writeFailure != nil {
+		return a.failIncomingFile(current, incoming, entry.Path, "destination write failed: "+writeFailure.Error())
+	}
+	if len(completion.Digest) != 64 || !strings.EqualFold(completion.Digest, digest) || !strings.EqualFold(entry.Digest, digest) || (completion.Success != nil && !*completion.Success) {
+		reason := completion.Reason
+		if reason == "" {
+			reason = "size or SHA-256 integrity check failed"
+		}
+		return a.failIncomingFile(current, incoming, entry.Path, reason)
 	}
 	finalPath := incomingPath(incoming, *entry)
 	if err := ensurePathBeneath(incoming.destination, finalPath); err != nil {
@@ -1427,16 +1550,14 @@ func (a *App) receiveContent(current *attempt, message session.Message) error {
 		return err
 	}
 	if err := publishWithoutOverwrite(incoming.stagingPath, finalPath); err != nil {
-		a.removeIncomingFiles(incoming)
-		success := false
-		_ = current.secure.Send(session.Message{Type: "result", OfferID: incoming.id, Path: entry.Path, Success: &success, Reason: "final path became unavailable"})
-		a.clearIncoming(current, incoming)
-		return nil
+		return a.failIncomingFile(current, incoming, entry.Path, "destination write failed: final path became unavailable")
 	}
 	incoming.stagingPath = ""
 	if err := applyBasicMetadata(finalPath, *entry); err != nil {
-		return fmt.Errorf("apply metadata to %s: %w", entry.Path, err)
+		_ = os.Remove(finalPath) // This offer created the path; never remove pre-existing content.
+		return a.failIncomingFile(current, incoming, entry.Path, "destination metadata write failed: "+err.Error())
 	}
+	incoming.fileOutcomes[manifestPathKey(entry.Path)] = struct{}{}
 	incoming.completedFile++
 	success := true
 	if err := current.secure.Send(session.Message{Type: "result", OfferID: incoming.id, Path: entry.Path, Success: &success}); err != nil {
@@ -1446,11 +1567,86 @@ func (a *App) receiveContent(current *attempt, message session.Message) error {
 	return nil
 }
 
+type recoverableWriter struct {
+	destination io.Writer
+	failure     error
+}
+
+func (w *recoverableWriter) Write(content []byte) (int, error) {
+	if w.failure != nil {
+		return len(content), nil
+	}
+	written, err := w.destination.Write(content)
+	if err != nil {
+		w.failure = err
+		return len(content), nil
+	}
+	if written != len(content) {
+		w.failure = io.ErrShortWrite
+		return len(content), nil
+	}
+	return written, nil
+}
+
+func (a *App) failIncomingFile(current *attempt, incoming *incomingOffer, path, reason string) error {
+	a.removeIncomingStaging(incoming)
+	if incoming.fileOutcomes == nil {
+		incoming.fileOutcomes = make(map[string]struct{}, incoming.manifest.FileCount)
+	}
+	incoming.fileOutcomes[manifestPathKey(path)] = struct{}{}
+	incoming.failedFile++
+	success := false
+	if err := current.secure.Send(session.Message{Type: "result", OfferID: incoming.id, Path: path, Success: &success, Reason: reason}); err != nil {
+		return err
+	}
+	a.line("Transfer failed for %s: %s; incomplete content was removed and other files will continue.", path, reason)
+	return nil
+}
+
+func isHexDigest(digest string) bool {
+	_, err := hex.DecodeString(digest)
+	return err == nil
+}
+
+func (a *App) receiveFileFailure(current *attempt, message session.Message) error {
+	a.mu.Lock()
+	incoming := current.incoming
+	a.mu.Unlock()
+	if incoming == nil || !incoming.accepted || incoming.id != message.OfferID || message.Path == "" || message.Reason == "" {
+		return errors.New("Peer reported a file failure without an accepted matching Transfer Offer")
+	}
+	found := false
+	for _, entry := range incoming.manifest.Entries {
+		if entry.Kind == manifestFile && entry.Path == message.Path {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return errors.New("Peer reported a failure for an unknown manifest file")
+	}
+	if incoming.fileOutcomes == nil {
+		incoming.fileOutcomes = make(map[string]struct{}, incoming.manifest.FileCount)
+	}
+	key := manifestPathKey(message.Path)
+	if _, completed := incoming.fileOutcomes[key]; completed {
+		return errors.New("Peer repeated an outcome for a manifest file")
+	}
+	incoming.fileOutcomes[key] = struct{}{}
+	incoming.failedFile++
+	success := false
+	if err := current.secure.Send(session.Message{Type: "result", OfferID: incoming.id, Path: message.Path, Success: &success, Reason: message.Reason}); err != nil {
+		return err
+	}
+	a.line("Transfer failed for %s: %s; other files will continue.", message.Path, message.Reason)
+	return nil
+}
+
 func (a *App) completeIncomingBatch(current *attempt, message session.Message) error {
 	a.mu.Lock()
 	incoming := current.incoming
 	a.mu.Unlock()
-	if incoming == nil || !incoming.accepted || incoming.id != message.OfferID || incoming.completedFile != incoming.manifest.FileCount {
+	if incoming == nil || !incoming.accepted || incoming.id != message.OfferID || incoming.completedFile+incoming.failedFile != incoming.manifest.FileCount {
 		return errors.New("Peer completed an inconsistent Transfer Offer")
 	}
 	for index := len(incoming.manifest.Entries) - 1; index >= 0; index-- {
@@ -1466,15 +1662,79 @@ func (a *App) completeIncomingBatch(current *attempt, message session.Message) e
 		}
 	}
 	removeEmptyStagingDirectory(incoming.destination)
-	success := true
+	success := incoming.failedFile == 0
 	if err := current.secure.Send(session.Message{Type: "result", OfferID: incoming.id, Success: &success}); err != nil {
 		return err
 	}
 	manifest := incoming.manifest
 	a.clearIncoming(current, incoming)
-	if manifest.FileCount != 1 || manifest.FolderCount != 0 {
+	if incoming.failedFile > 0 {
+		a.line("Transfer Offer partially completed: %d of %d files succeeded; %d failed.", incoming.completedFile, manifest.FileCount, incoming.failedFile)
+	} else if manifest.FileCount != 1 || manifest.FolderCount != 0 {
 		a.line("Received Transfer Offer: %d files, %d folders (%d bytes)", manifest.FileCount, manifest.FolderCount, manifest.TotalBytes)
 	}
+	return nil
+}
+
+func (a *App) cancelActiveOffer() bool {
+	a.mu.Lock()
+	current := a.current
+	if current == nil || current.secure == nil || !current.transferActive {
+		a.mu.Unlock()
+		return false
+	}
+	var offerID string
+	if current.outgoing != nil {
+		if current.outgoing.canceled {
+			a.mu.Unlock()
+			return true
+		}
+		current.outgoing.canceled = true
+		offerID = current.outgoing.id
+	} else if current.incoming != nil {
+		if current.incoming.canceled {
+			a.mu.Unlock()
+			return true
+		}
+		current.incoming.canceled = true
+		offerID = current.incoming.id
+	} else {
+		a.mu.Unlock()
+		return false
+	}
+	secured := current.secure
+	a.mu.Unlock()
+	a.line("Canceling the active Transfer Offer...")
+	go func() {
+		if err := secured.Send(session.Message{Type: "cancel", OfferID: offerID}); err != nil && current.context.Err() == nil {
+			a.line("Could not request Transfer Offer cancellation: %v", err)
+		}
+	}()
+	return true
+}
+
+func (a *App) handlePeerCancellation(current *attempt, message session.Message) error {
+	a.mu.Lock()
+	if current.outgoing != nil && current.outgoing.id == message.OfferID {
+		current.outgoing.canceled = true
+		a.mu.Unlock()
+		return nil
+	}
+	incoming := current.incoming
+	if incoming == nil || incoming.id != message.OfferID || !incoming.accepted {
+		a.mu.Unlock()
+		return nil
+	}
+	incoming.canceled = true
+	a.mu.Unlock()
+
+	a.removeIncomingFiles(incoming)
+	success := false
+	if err := current.secure.Send(session.Message{Type: "result", OfferID: incoming.id, Success: &success, Reason: reasonOfferCanceled}); err != nil {
+		return err
+	}
+	a.clearIncoming(current, incoming)
+	a.line("Transfer Offer canceled; incomplete content was removed and completed files were retained.")
 	return nil
 }
 
@@ -1577,6 +1837,11 @@ func (a *App) cleanupIncoming(current *attempt) {
 }
 
 func (a *App) removeIncomingFiles(incoming *incomingOffer) {
+	a.removeIncomingStaging(incoming)
+	removeCreatedDirectories(incoming)
+}
+
+func (a *App) removeIncomingStaging(incoming *incomingOffer) {
 	if incoming.stagingFile != nil {
 		_ = incoming.stagingFile.Close()
 		incoming.stagingFile = nil
@@ -1588,8 +1853,52 @@ func (a *App) removeIncomingFiles(incoming *incomingOffer) {
 	removeEmptyStagingDirectory(incoming.destination)
 }
 
+func removeCreatedDirectories(incoming *incomingOffer) {
+	for index := len(incoming.createdDirectories) - 1; index >= 0; index-- {
+		_ = os.Remove(incoming.createdDirectories[index]) // Removes only empty paths; completed files are never touched.
+	}
+	incoming.createdDirectories = nil
+}
+
 func removeEmptyStagingDirectory(destination string) {
 	_ = os.Remove(filepath.Join(destination, ".transferly-staging"))
+}
+
+func hasStaleStaging(destination string) (bool, error) {
+	staging := filepath.Join(destination, ".transferly-staging")
+	info, err := os.Lstat(staging)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return false, errors.New("the Transferly staging path is not a safe folder")
+	}
+	if err := rejectReparsePoint(staging); err != nil {
+		return false, err
+	}
+	entries, err := os.ReadDir(staging)
+	if err != nil {
+		return false, err
+	}
+	if len(entries) == 0 {
+		_ = os.Remove(staging)
+		return false, nil
+	}
+	return true, nil
+}
+
+func cleanupStaleStaging(destination string) error {
+	staging := filepath.Join(destination, ".transferly-staging")
+	if err := ensurePathBeneath(destination, staging); err != nil {
+		return err
+	}
+	if err := rejectReparsePoint(staging); err != nil {
+		return err
+	}
+	return os.RemoveAll(staging)
 }
 
 func defaultDestination() (string, error) {
