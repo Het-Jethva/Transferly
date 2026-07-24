@@ -2,9 +2,11 @@ package integration_test
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Het-Jethva/Transferly/internal/session"
 	_ "github.com/Het-Jethva/Transferly/internal/terminal" // Invalidate black-box tests when the executable changes.
 )
 
@@ -163,6 +166,56 @@ func TestMixedFilesAndFoldersArePublishedAsOneTransferOffer(t *testing.T) {
 	if info, err := os.Stat(filepath.Join(downloads, "Project Ω", "nested", "empty")); err != nil || !info.IsDir() {
 		t.Fatalf("empty folder was not published: info=%v err=%v", info, err)
 	}
+}
+
+func TestHostilePeerManifestPathsEndTheSessionBeforeContentIsAccepted(t *testing.T) {
+	tests := map[string]string{
+		"../escape.txt":          "traversal segment",
+		"/absolute.txt":          "absolute path",
+		"folder/CON.txt":         "Windows reserved name",
+		"folder/trailing.txt. ":  "trailing dot or space",
+		"folder/file.txt:stream": "colon",
+	}
+	for path, reason := range tests {
+		t.Run(reason, func(t *testing.T) {
+			receiver := startPeer(t, transferlyExecutable)
+			hostile := openHostileSession(t, receiver)
+			if err := hostile.Send(session.Message{Type: "offer", OfferID: strings.Repeat("a", 32), RootCount: 1, FileCount: 1, TotalBytes: 1}); err != nil {
+				t.Fatal(err)
+			}
+			if err := hostile.Send(session.Message{Type: "manifest-entry", OfferID: strings.Repeat("a", 32), Path: path, Kind: "file", Size: 1}); err != nil {
+				t.Fatal(err)
+			}
+			receiver.waitFor(t, reason)
+			receiver.waitFor(t, "Transfer Session ended after a connection error")
+
+			downloads := filepath.Join(receiver.homeDir, "Downloads")
+			if entries, err := os.ReadDir(downloads); err == nil && len(entries) != 0 {
+				t.Fatalf("hostile manifest wrote destination content: %v", entries)
+			} else if err != nil && !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestHostilePeerUnicodeCaseAliasesAreRejected(t *testing.T) {
+	receiver := startPeer(t, transferlyExecutable)
+	hostile := openHostileSession(t, receiver)
+	offerID := strings.Repeat("b", 32)
+	if err := hostile.Send(session.Message{Type: "offer", OfferID: offerID, RootCount: 2, FileCount: 2, TotalBytes: 2}); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"Résumé.txt", "RE\u0301SUME\u0301.TXT"} {
+		if err := hostile.Send(session.Message{Type: "manifest-entry", OfferID: offerID, Path: path, Kind: "file", Size: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := hostile.Send(session.Message{Type: "offer-complete", OfferID: offerID}); err != nil {
+		t.Fatal(err)
+	}
+	receiver.waitFor(t, "case-insensitive or Unicode alias")
+	receiver.waitFor(t, "Transfer Session ended after a connection error")
 }
 
 func TestAcceptedFileIsPublishedWithoutChangingTheSource(t *testing.T) {
@@ -398,6 +451,59 @@ func TestExistingDestinationIsNotOverwrittenAndConflictNameIsPreviewed(t *testin
 	if err != nil || string(generated) != "new notes" {
 		t.Fatalf("generated destination: bytes=%q err=%v", generated, err)
 	}
+}
+
+func TestExistingFolderIsNotMergedAndConflictNameIsPreviewed(t *testing.T) {
+	sender := startPeer(t, transferlyExecutable)
+	receiver := startPeer(t, transferlyExecutable)
+	verifyPeers(t, sender, receiver)
+
+	sourceRoot := t.TempDir()
+	sourceFolder := filepath.Join(sourceRoot, "photos")
+	if err := os.Mkdir(sourceFolder, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceFolder, "new.jpg"), []byte("new image"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	downloads := filepath.Join(receiver.homeDir, "Downloads")
+	existingFolder := filepath.Join(downloads, "PHOTOS")
+	if err := os.MkdirAll(existingFolder, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(existingFolder, "existing.jpg"), []byte("existing image"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sender.send(t, "send "+sourceFolder)
+	generatedFolder := filepath.Join(downloads, "photos (1)")
+	receiver.waitFor(t, "Final path: "+generatedFolder)
+	receiver.send(t, "accept")
+	receiver.waitFor(t, "Received photos/new.jpg")
+
+	assertFileContent(t, filepath.Join(existingFolder, "existing.jpg"), "existing image")
+	if _, err := os.Stat(filepath.Join(existingFolder, "new.jpg")); !os.IsNotExist(err) {
+		t.Fatalf("accepted folder silently merged into existing folder: %v", err)
+	}
+	assertFileContent(t, filepath.Join(generatedFolder, "new.jpg"), "new image")
+}
+
+func TestExecutableAndScriptFilesAreWarnedBeforeApproval(t *testing.T) {
+	sender := startPeer(t, transferlyExecutable)
+	receiver := startPeer(t, transferlyExecutable)
+	verifyPeers(t, sender, receiver)
+
+	script := filepath.Join(t.TempDir(), "install.PS1")
+	if err := os.WriteFile(script, []byte("Write-Host safe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sender.send(t, "send "+script)
+	receiver.waitFor(t, "WARNING: 1 executable or script file(s) in this Transfer Offer")
+	receiver.send(t, "details")
+	receiver.waitFor(t, "file install.PS1 [EXECUTABLE OR SCRIPT]")
+	receiver.send(t, "accept")
+	receiver.waitFor(t, "Received install.PS1")
+	assertFileContent(t, filepath.Join(receiver.homeDir, "Downloads", "install.PS1"), "Write-Host safe")
 }
 
 func TestReceiverOverridesDestinationForOneOffer(t *testing.T) {
@@ -907,6 +1013,54 @@ func TestQuitExitsCleanlyWithoutSavingTrust(t *testing.T) {
 	if len(entries) != 0 {
 		t.Fatalf("Transferly persisted process state in %s: %v", peer.workDir, entries)
 	}
+}
+
+func openHostileSession(t *testing.T, receiver *peerProcess) *session.Session {
+	t.Helper()
+	previousCodes := receiver.matchCount(verificationCodePattern)
+	connection, err := net.Dial("tcp4", receiver.endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = connection.Close() })
+
+	opened := make(chan *session.Session, 1)
+	openErrors := make(chan error, 1)
+	codes := make(chan string, 1)
+	go func() {
+		secured, openError := session.Open(context.Background(), connection, session.Outbound, session.Version{Major: 2}, func(_ context.Context, code string) (bool, error) {
+			codes <- code
+			return true, nil
+		})
+		if openError != nil {
+			openErrors <- openError
+			return
+		}
+		opened <- secured
+	}()
+	receiverCode := receiver.waitForCode(t, previousCodes)
+	var hostileCode string
+	select {
+	case hostileCode = <-codes:
+	case err := <-openErrors:
+		t.Fatalf("open hostile session: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for hostile Peer verification code")
+	}
+	if receiverCode != hostileCode {
+		t.Fatalf("hostile Peer verification codes differ: %s and %s", receiverCode, hostileCode)
+	}
+	receiver.send(t, "yes")
+	select {
+	case secured := <-opened:
+		t.Cleanup(func() { _ = secured.Close() })
+		return secured
+	case err := <-openErrors:
+		t.Fatalf("open hostile session: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out opening hostile Transfer Session")
+	}
+	return nil
 }
 
 func verifyPeers(t *testing.T, first, second *peerProcess) {

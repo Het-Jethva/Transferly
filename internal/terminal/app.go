@@ -985,8 +985,12 @@ func (a *App) takeNextOutgoingLocked(current *attempt) *outgoingOffer {
 }
 
 func (a *App) handleIncomingOffer(current *attempt, message session.Message) error {
-	if message.OfferID == "" || message.RootCount < 1 || message.FileCount < 0 || message.FolderCount < 0 || message.TotalBytes < 0 {
-		return errors.New("Peer sent an invalid Transfer Offer")
+	entryCount := int64(message.FileCount) + int64(message.FolderCount)
+	if len(message.OfferID) != 32 || message.RootCount < 1 || message.RootCount > maxManifestEntries || message.FileCount < 0 || message.FolderCount < 0 || entryCount < 1 || entryCount > maxManifestEntries || message.TotalBytes < 0 {
+		return errors.New("Peer sent an invalid or oversized Transfer Offer header")
+	}
+	if _, err := hex.DecodeString(message.OfferID); err != nil {
+		return errors.New("Peer sent an invalid Transfer Offer identifier")
 	}
 	destination, err := defaultDestination()
 	if err != nil {
@@ -1016,13 +1020,25 @@ func (a *App) handleIncomingManifest(current *attempt, message session.Message) 
 	}
 	switch message.Type {
 	case "manifest-entry":
-		if !safeRelativePath(message.Path) || (message.Kind != manifestFile && message.Kind != manifestFolder) || message.Size < 0 || (message.Kind == manifestFolder && message.Size != 0) {
+		if len(incoming.manifest.Entries) >= maxManifestEntries {
+			return errors.New("Peer sent too many manifest entries")
+		}
+		if err := validateManifestPath(message.Path); err != nil {
+			return fmt.Errorf("Peer sent unsafe manifest path %q: %w", message.Path, err)
+		}
+		if (message.Kind != manifestFile && message.Kind != manifestFolder) || message.Size < 0 || (message.Kind == manifestFolder && message.Size != 0) {
 			return errors.New("Peer sent an invalid manifest entry")
 		}
 		incoming.manifest.Entries = append(incoming.manifest.Entries, manifestEntry{Path: message.Path, Kind: message.Kind, Size: message.Size, Modified: time.Unix(0, message.Modified), ReadOnly: message.ReadOnly, Hidden: message.Hidden})
 	case "manifest-omission":
-		if !safeRelativePath(message.Path) || message.Reason == "" {
-			return errors.New("Peer sent an invalid manifest omission")
+		if len(incoming.manifest.Omissions) >= maxManifestOmissions {
+			return errors.New("Peer sent too many manifest omissions")
+		}
+		if err := validateManifestPath(message.Path); err != nil {
+			return fmt.Errorf("Peer sent unsafe omission path %q: %w", message.Path, err)
+		}
+		if message.Reason == "" || len(message.Reason) > maxOmissionReason {
+			return errors.New("Peer sent an invalid manifest omission reason")
 		}
 		incoming.manifest.Omissions = append(incoming.manifest.Omissions, manifestOmission{Path: message.Path, Reason: message.Reason})
 	case "offer-complete":
@@ -1058,32 +1074,46 @@ func (a *App) handleIncomingManifest(current *attempt, message session.Message) 
 	return nil
 }
 
-func safeRelativePath(path string) bool {
-	if path == "" || strings.ContainsAny(path, "\\\x00\r\n") {
-		return false
-	}
-	cleaned := filepath.ToSlash(filepath.Clean(filepath.FromSlash(path)))
-	return cleaned == path && path != "." && path != ".." && !strings.HasPrefix(path, "../") && !filepath.IsAbs(filepath.FromSlash(path))
-}
-
 func validateReceivedManifest(incoming *incomingOffer) error {
 	files, folders := 0, 0
 	var bytes int64
-	seen := make(map[string]struct{})
+	seen := make(map[string]manifestEntry, len(incoming.manifest.Entries))
+	incoming.manifest.Roots = nil
 	for _, entry := range incoming.manifest.Entries {
-		key := strings.ToLower(entry.Path)
-		if _, exists := seen[key]; exists {
-			return errors.New("Peer sent duplicate manifest paths")
+		if err := validateManifestPath(entry.Path); err != nil {
+			return fmt.Errorf("Peer sent unsafe manifest path %q: %w", entry.Path, err)
 		}
-		seen[key] = struct{}{}
+		key := manifestPathKey(entry.Path)
+		if _, exists := seen[key]; exists {
+			return fmt.Errorf("Peer sent manifest paths with a case-insensitive or Unicode alias: %q", entry.Path)
+		}
+		seen[key] = entry
 		if entry.Kind == manifestFile {
 			files++
+			if entry.Size > incoming.manifest.TotalBytes-bytes {
+				return errors.New("Peer sent a Transfer Offer whose byte total overflows or is inconsistent")
+			}
 			bytes += entry.Size
-		} else {
+		} else if entry.Kind == manifestFolder {
 			folders++
+		} else {
+			return errors.New("Peer sent an unsupported manifest entry kind")
 		}
 		if !strings.Contains(entry.Path, "/") {
 			incoming.manifest.Roots = append(incoming.manifest.Roots, entry.Path)
+		}
+	}
+	for _, entry := range incoming.manifest.Entries {
+		parent := entry.Path
+		for strings.Contains(parent, "/") {
+			parent = parent[:strings.LastIndex(parent, "/")]
+			parentEntry, exists := seen[manifestPathKey(parent)]
+			if !exists {
+				return fmt.Errorf("Peer sent manifest path %q without its parent folder %q", entry.Path, parent)
+			}
+			if parentEntry.Kind != manifestFolder {
+				return fmt.Errorf("Peer sent an invalid manifest hierarchy: file is used as a parent for %q", entry.Path)
+			}
 		}
 	}
 	if files != incoming.manifest.FileCount || folders != incoming.manifest.FolderCount || bytes != incoming.manifest.TotalBytes || len(incoming.manifest.Roots) != incoming.rootCount {
@@ -1156,13 +1186,18 @@ func (a *App) reviewIncomingOffer(current *attempt, incoming *incomingOffer) err
 }
 
 func resolveIncomingPaths(incoming *incomingOffer) error {
+	destination, reserved, err := destinationNameReservations(incoming.destination)
+	if err != nil {
+		return err
+	}
+	incoming.destination = destination
 	incoming.finalPaths = make(map[string]string)
 	for _, root := range incoming.manifest.Roots {
-		path, err := resolveFinalPath(incoming.destination, root)
+		path, err := resolveFinalPathWithReservations(destination, root, reserved)
 		if err != nil {
-			return err
+			return fmt.Errorf("resolve top-level destination for %q: %w", root, err)
 		}
-		incoming.finalPaths[strings.ToLower(root)] = path
+		incoming.finalPaths[manifestPathKey(root)] = path
 	}
 	return nil
 }
@@ -1177,7 +1212,10 @@ func (a *App) showIncoming(incoming *incomingOffer) {
 	}
 	a.line("Destination: %s", incoming.destination)
 	for _, root := range manifest.Roots {
-		a.line("Final path: %s", incoming.finalPaths[strings.ToLower(root)])
+		a.line("Final path: %s", incoming.finalPaths[manifestPathKey(root)])
+	}
+	if executableCount := len(executablePaths(manifest)); executableCount > 0 {
+		a.line("WARNING: %d executable or script file(s) in this Transfer Offer. Review details before accepting.", executableCount)
 	}
 	if len(manifest.Omissions) > 0 {
 		a.line("Omissions: %d unsupported, unreadable, or vanished entries (type details to review)", len(manifest.Omissions))
@@ -1203,7 +1241,11 @@ func (a *App) showManifestDetails(incoming *incomingOffer) {
 			attributes = append(attributes, "none")
 		}
 		if entry.Kind == manifestFile {
-			a.line("  file %s (%d bytes), modified %s, attributes %s", entry.Path, entry.Size, entry.Modified.Format(time.RFC3339Nano), strings.Join(attributes, ", "))
+			warning := ""
+			if isExecutableOrScript(entry.Path) {
+				warning = " [EXECUTABLE OR SCRIPT]"
+			}
+			a.line("  file %s%s (%d bytes), modified %s, attributes %s", entry.Path, warning, entry.Size, entry.Modified.Format(time.RFC3339Nano), strings.Join(attributes, ", "))
 		} else {
 			a.line("  folder %s, modified %s, attributes %s", entry.Path, entry.Modified.Format(time.RFC3339Nano), strings.Join(attributes, ", "))
 		}
@@ -1214,22 +1256,99 @@ func (a *App) showManifestDetails(incoming *incomingOffer) {
 }
 
 func prepareIncoming(incoming *incomingOffer) error {
-	if err := os.MkdirAll(incoming.destination, 0o755); err != nil {
-		return err
+	if err := rejectExistingReparseComponents(incoming.destination); err != nil {
+		return fmt.Errorf("destination is unsafe: %w", err)
 	}
-	for _, entry := range incoming.manifest.Entries {
-		if entry.Kind == manifestFolder {
-			if err := os.MkdirAll(incomingPath(incoming, entry), 0o755); err != nil {
-				return err
-			}
+	if err := os.MkdirAll(incoming.destination, 0o755); err != nil {
+		return fmt.Errorf("create destination: %w", err)
+	}
+	if err := rejectExistingReparseComponents(incoming.destination); err != nil {
+		return fmt.Errorf("destination is unsafe: %w", err)
+	}
+	info, err := os.Stat(incoming.destination)
+	if err != nil || !info.IsDir() {
+		return errors.New("destination is not a folder")
+	}
+	if available, reliable, err := availableDiskBytes(incoming.destination); err != nil {
+		return fmt.Errorf("check available disk space: %w", err)
+	} else if reliable && uint64(incoming.manifest.TotalBytes) > available {
+		return fmt.Errorf("insufficient disk space: need %d bytes, only %d bytes are available", incoming.manifest.TotalBytes, available)
+	}
+
+	createdRoots := make([]string, 0, len(incoming.manifest.Roots))
+	rollbackRoots := func() {
+		for index := len(createdRoots) - 1; index >= 0; index-- {
+			_ = os.Remove(createdRoots[index]) // Remove only empty paths we created; never remove user content.
 		}
 	}
-	return os.MkdirAll(filepath.Join(incoming.destination, ".transferly-staging"), 0o700)
+	for _, root := range incoming.manifest.Roots {
+		var rootEntry *manifestEntry
+		for index := range incoming.manifest.Entries {
+			if manifestPathKey(incoming.manifest.Entries[index].Path) == manifestPathKey(root) {
+				rootEntry = &incoming.manifest.Entries[index]
+				break
+			}
+		}
+		if rootEntry == nil {
+			rollbackRoots()
+			return fmt.Errorf("manifest root %q has no entry", root)
+		}
+		finalPath := incoming.finalPaths[manifestPathKey(root)]
+		if err := ensurePathBeneath(incoming.destination, finalPath); err != nil {
+			rollbackRoots()
+			return err
+		}
+		if _, err := os.Lstat(finalPath); err == nil || !os.IsNotExist(err) {
+			rollbackRoots()
+			return fmt.Errorf("final path %s became unavailable after approval", finalPath)
+		}
+		if rootEntry.Kind == manifestFolder {
+			if err := os.Mkdir(finalPath, 0o755); err != nil {
+				rollbackRoots()
+				return fmt.Errorf("final path %s became unavailable after approval: %w", finalPath, err)
+			}
+			createdRoots = append(createdRoots, finalPath)
+		}
+	}
+	folders := make([]manifestEntry, 0, incoming.manifest.FolderCount)
+	for _, entry := range incoming.manifest.Entries {
+		if entry.Kind == manifestFolder && strings.Contains(entry.Path, "/") {
+			folders = append(folders, entry)
+		}
+	}
+	sort.Slice(folders, func(i, j int) bool {
+		return strings.Count(folders[i].Path, "/") < strings.Count(folders[j].Path, "/")
+	})
+	for _, entry := range folders {
+		path := incomingPath(incoming, entry)
+		if err := ensurePathBeneath(incoming.destination, path); err != nil {
+			rollbackRoots()
+			return err
+		}
+		if err := os.Mkdir(path, 0o755); err != nil {
+			rollbackRoots()
+			return fmt.Errorf("create manifest folder %s: %w", entry.Path, err)
+		}
+	}
+	staging := filepath.Join(incoming.destination, ".transferly-staging")
+	if err := ensurePathBeneath(incoming.destination, staging); err != nil {
+		rollbackRoots()
+		return err
+	}
+	if err := rejectReparsePoint(staging); err != nil {
+		rollbackRoots()
+		return fmt.Errorf("staging area is unsafe: %w", err)
+	}
+	if err := os.MkdirAll(staging, 0o700); err != nil {
+		rollbackRoots()
+		return err
+	}
+	return nil
 }
 
 func incomingPath(incoming *incomingOffer, entry manifestEntry) string {
 	parts := strings.Split(entry.Path, "/")
-	root := incoming.finalPaths[strings.ToLower(parts[0])]
+	root := incoming.finalPaths[manifestPathKey(parts[0])]
 	if len(parts) == 1 {
 		return root
 	}
@@ -1253,7 +1372,11 @@ func (a *App) receiveContent(current *attempt, message session.Message) error {
 	if entry == nil || entry.Kind != manifestFile || entry.Size != message.Size {
 		return errors.New("Peer sent content for an unknown manifest file")
 	}
-	file, err := os.CreateTemp(filepath.Join(incoming.destination, ".transferly-staging"), "incoming-*.part")
+	stagingDirectory := filepath.Join(incoming.destination, ".transferly-staging")
+	if err := rejectReparseAncestors(incoming.destination, stagingDirectory); err != nil {
+		return fmt.Errorf("staging area became unsafe: %w", err)
+	}
+	file, err := os.CreateTemp(stagingDirectory, "incoming-*.part")
 	if err != nil {
 		return err
 	}
@@ -1292,6 +1415,14 @@ func (a *App) receiveContent(current *attempt, message session.Message) error {
 		return nil
 	}
 	finalPath := incomingPath(incoming, *entry)
+	if err := ensurePathBeneath(incoming.destination, finalPath); err != nil {
+		a.removeIncomingFiles(incoming)
+		return err
+	}
+	if err := rejectReparseAncestors(incoming.destination, filepath.Dir(finalPath)); err != nil {
+		a.removeIncomingFiles(incoming)
+		return fmt.Errorf("final path became unsafe: %w", err)
+	}
 	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil {
 		return err
 	}
@@ -1325,7 +1456,11 @@ func (a *App) completeIncomingBatch(current *attempt, message session.Message) e
 	for index := len(incoming.manifest.Entries) - 1; index >= 0; index-- {
 		entry := incoming.manifest.Entries[index]
 		if entry.Kind == manifestFolder {
-			if err := applyBasicMetadata(incomingPath(incoming, entry), entry); err != nil {
+			path := incomingPath(incoming, entry)
+			if err := rejectReparseAncestors(incoming.destination, path); err != nil {
+				return fmt.Errorf("manifest folder became unsafe: %w", err)
+			}
+			if err := applyBasicMetadata(path, entry); err != nil {
 				return err
 			}
 		}
@@ -1466,34 +1601,54 @@ func defaultDestination() (string, error) {
 }
 
 func resolveFinalPath(destination, name string) (string, error) {
-	if !safeFileName(name) {
-		return "", errors.New("file name is not safe")
-	}
-	destination, err := filepath.Abs(destination)
+	destination, reserved, err := destinationNameReservations(destination)
 	if err != nil {
 		return "", err
 	}
+	return resolveFinalPathWithReservations(destination, name, reserved)
+}
+
+func destinationNameReservations(destination string) (string, map[string]struct{}, error) {
+	destination, err := filepath.Abs(destination)
+	if err != nil {
+		return "", nil, err
+	}
 	entries, err := os.ReadDir(destination)
 	if err != nil && !os.IsNotExist(err) {
-		return "", err
+		return "", nil, err
 	}
-	existing := make(map[string]struct{}, len(entries))
+	reserved := make(map[string]struct{}, len(entries))
 	for _, entry := range entries {
-		existing[strings.ToLower(entry.Name())] = struct{}{}
+		reserved[manifestPathKey(entry.Name())] = struct{}{}
+	}
+	return destination, reserved, nil
+}
+
+func resolveFinalPathWithReservations(destination, name string, reserved map[string]struct{}) (string, error) {
+	if err := validateManifestPath(name); err != nil || strings.Contains(name, "/") {
+		if err == nil {
+			err = errors.New("top-level name contains a path separator")
+		}
+		return "", err
 	}
 	candidate := name
 	extension := filepath.Ext(name)
 	stem := strings.TrimSuffix(name, extension)
 	for suffix := 1; ; suffix++ {
-		if _, found := existing[strings.ToLower(candidate)]; !found {
-			return filepath.Join(destination, candidate), nil
+		if err := validateWindowsComponent(candidate); err != nil {
+			return "", err
+		}
+		resolved := filepath.Join(destination, candidate)
+		if err := ensurePathBeneath(destination, resolved); err != nil {
+			return "", err
+		}
+		key := manifestPathKey(candidate)
+		if _, found := reserved[key]; !found {
+			reserved[key] = struct{}{}
+			return resolved, nil
 		}
 		candidate = fmt.Sprintf("%s (%d)%s", stem, suffix, extension)
 	}
-}
-
-func safeFileName(name string) bool {
-	return name != "" && name != "." && name != ".." && filepath.Base(name) == name && !strings.ContainsAny(name, "/\\\x00\r\n")
 }
 
 func newOfferID() (string, error) {

@@ -52,13 +52,18 @@ func buildManifest(paths []string) (offerManifest, error) {
 			return offerManifest{}, fmt.Errorf("inspect %q: %w", path, err)
 		}
 		name := info.Name()
-		key := strings.ToLower(name)
+		if err := validateManifestPath(name); err != nil {
+			return offerManifest{}, fmt.Errorf("top-level name %q cannot be transferred safely: %w", name, err)
+		}
+		key := manifestPathKey(name)
 		if _, duplicate := rootNames[key]; duplicate {
-			return offerManifest{}, fmt.Errorf("top-level name %q is duplicated", name)
+			return offerManifest{}, fmt.Errorf("top-level name %q has a case-insensitive or Unicode duplicate", name)
 		}
 		rootNames[key] = struct{}{}
 		manifest.Roots = append(manifest.Roots, name)
-		walkManifestRoot(&manifest, absolute, name)
+		if err := walkManifestRoot(&manifest, absolute, name); err != nil {
+			return offerManifest{}, err
+		}
 	}
 	if len(manifest.Entries) == 0 {
 		return offerManifest{}, errors.New("no readable files or folders were found")
@@ -66,20 +71,23 @@ func buildManifest(paths []string) (offerManifest, error) {
 	return manifest, nil
 }
 
-func walkManifestRoot(manifest *offerManifest, sourcePath, relativePath string) {
+func walkManifestRoot(manifest *offerManifest, sourcePath, relativePath string) error {
+	if len(manifest.Entries) >= maxManifestEntries {
+		return fmt.Errorf("Transfer Offer manifest exceeds the safe limit of %d entries", maxManifestEntries)
+	}
+	if err := validateManifestPath(filepath.ToSlash(relativePath)); err != nil {
+		return fmt.Errorf("source path %q cannot be represented safely: %w", relativePath, err)
+	}
 	info, err := os.Lstat(sourcePath)
 	if err != nil {
-		manifest.Omissions = append(manifest.Omissions, manifestOmission{Path: filepath.ToSlash(relativePath), Reason: "unreadable or vanished"})
-		return
+		return addManifestOmission(manifest, filepath.ToSlash(relativePath), "unreadable or vanished")
 	}
 	attributes, err := readBasicAttributes(sourcePath, info)
 	if err != nil {
-		manifest.Omissions = append(manifest.Omissions, manifestOmission{Path: filepath.ToSlash(relativePath), Reason: "attributes could not be read"})
-		return
+		return addManifestOmission(manifest, filepath.ToSlash(relativePath), "attributes could not be read")
 	}
 	if info.Mode()&os.ModeSymlink != 0 || attributes.ReparsePoint {
-		manifest.Omissions = append(manifest.Omissions, manifestOmission{Path: filepath.ToSlash(relativePath), Reason: "symbolic link, junction, or reparse point is unsupported"})
-		return
+		return addManifestOmission(manifest, filepath.ToSlash(relativePath), "symbolic link, junction, or reparse point is unsupported")
 	}
 	relativePath = filepath.ToSlash(relativePath)
 	entry := manifestEntry{SourcePath: sourcePath, Path: relativePath, Modified: info.ModTime(), ReadOnly: attributes.ReadOnly, Hidden: attributes.Hidden}
@@ -87,12 +95,14 @@ func walkManifestRoot(manifest *offerManifest, sourcePath, relativePath string) 
 	case info.Mode().IsRegular():
 		probe, openError := os.Open(sourcePath)
 		if openError != nil {
-			manifest.Omissions = append(manifest.Omissions, manifestOmission{Path: relativePath, Reason: "unreadable"})
-			return
+			return addManifestOmission(manifest, relativePath, "unreadable")
 		}
 		_ = probe.Close()
 		entry.Kind = manifestFile
 		entry.Size = info.Size()
+		if entry.Size > int64(^uint64(0)>>1)-manifest.TotalBytes {
+			return errors.New("Transfer Offer total byte count overflows the protocol")
+		}
 		manifest.Entries = append(manifest.Entries, entry)
 		manifest.FileCount++
 		manifest.TotalBytes += info.Size()
@@ -102,16 +112,32 @@ func walkManifestRoot(manifest *offerManifest, sourcePath, relativePath string) 
 		manifest.FolderCount++
 		children, readError := os.ReadDir(sourcePath)
 		if readError != nil {
-			manifest.Omissions = append(manifest.Omissions, manifestOmission{Path: relativePath, Reason: "folder is unreadable"})
-			return
+			return addManifestOmission(manifest, relativePath, "folder is unreadable")
 		}
-		sort.Slice(children, func(i, j int) bool { return strings.ToLower(children[i].Name()) < strings.ToLower(children[j].Name()) })
+		sort.Slice(children, func(i, j int) bool { return manifestPathKey(children[i].Name()) < manifestPathKey(children[j].Name()) })
+		childNames := make(map[string]string, len(children))
 		for _, child := range children {
-			walkManifestRoot(manifest, filepath.Join(sourcePath, child.Name()), filepath.Join(relativePath, child.Name()))
+			key := manifestPathKey(child.Name())
+			if previous, exists := childNames[key]; exists {
+				return fmt.Errorf("folder %q contains case-insensitive or Unicode aliases %q and %q", relativePath, previous, child.Name())
+			}
+			childNames[key] = child.Name()
+			if err := walkManifestRoot(manifest, filepath.Join(sourcePath, child.Name()), filepath.Join(relativePath, child.Name())); err != nil {
+				return err
+			}
 		}
 	default:
-		manifest.Omissions = append(manifest.Omissions, manifestOmission{Path: relativePath, Reason: "unsupported filesystem entry"})
+		return addManifestOmission(manifest, relativePath, "unsupported filesystem entry")
 	}
+	return nil
+}
+
+func addManifestOmission(manifest *offerManifest, path, reason string) error {
+	if len(manifest.Omissions) >= maxManifestOmissions {
+		return fmt.Errorf("Transfer Offer manifest exceeds the safe limit of %d omissions", maxManifestOmissions)
+	}
+	manifest.Omissions = append(manifest.Omissions, manifestOmission{Path: path, Reason: reason})
+	return nil
 }
 
 func parsePathArguments(argument string) ([]string, bool) {
