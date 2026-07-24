@@ -20,7 +20,7 @@ $env:GOARCH = "amd64"
 go build -trimpath -ldflags "-s -w -X main.buildVersion=v1.0.0" -o transferly.exe ./cmd/transferly
 ```
 
-The resulting single executable is portable: it needs no installer, separate Go runtime, background service, system-tray process, or administrator privileges. Release artifacts should be Authenticode-signed with the project's protected signing credentials. Check the executable and independently versioned wire protocol with `transferly.exe --version`. Updates are manual: replace the executable with a newer signed build. Transferly performs no update checks.
+The resulting single executable is portable: it needs no installer, separate Go runtime, background service, system-tray process, or administrator privileges. Release artifacts must be Authenticode-signed with the project's protected signing credentials. `scripts/build-release.ps1` performs a reproducibility check, and `scripts/verify-portable.ps1` checks the Windows x64 artifact in an isolated directory. The protected release workflow refuses to publish a missing or invalid signature. See [the release validation runbook](docs/release-validation.md) for signing, automated gates, and the physical two-laptop matrix. Check the executable and independently versioned wire protocol with `transferly.exe --version`. Updates are manual: replace the executable with a newer signed build. Transferly performs no update checks.
 
 ## Use
 
@@ -95,9 +95,12 @@ Transferly's network activity is limited to explicit local mDNS/DNS-SD discovery
 ```powershell
 go test ./...
 go test -race ./...
+go test ./internal/session -run=^$ -fuzz=^FuzzProtocolFrameLengthHandling$ -fuzztime=30s
+go test ./internal/terminal -run=^$ -fuzz=^FuzzManifestPathConfinement$ -fuzztime=30s
+go test ./internal/session -run=^$ -bench=^BenchmarkThroughput$ -benchtime=3x -benchmem
 ```
 
-The integration suite builds and launches real Transferly processes over loopback and interacts with their public terminal interface. On a multicast-capable local network, opt into the two-process real mDNS check:
+The integration suite builds and launches real Transferly processes over loopback and interacts with their public terminal interface. CI also runs the targeted verification-code, conflict-name, and manifest-limit fuzz smoke tests, the race detector, benchmarks, and reproducible portable-package checks. Complete commands and expected evidence are in [the release validation runbook](docs/release-validation.md). On a multicast-capable local network, opt into the two-process real mDNS check:
 
 ```powershell
 $env:TRANSFERLY_TEST_MDNS = "1"

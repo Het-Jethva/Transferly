@@ -225,6 +225,33 @@ func TestMixedFilesAndFoldersArePublishedAsOneTransferOffer(t *testing.T) {
 	}
 }
 
+func TestMalformedAndTruncatedWireStreamsFailClosedAndLeaveThePeerAvailable(t *testing.T) {
+	receiver := startPeer(t, transferlyExecutable)
+	failure := "Could not establish a secure Transfer Session"
+	for index, payload := range [][]byte{
+		[]byte("{not-a-tls-or-protocol-frame}\n"),
+		{0x16, 0x03, 0x03, 0x00, 0x20, 0x01, 0x02}, // truncated TLS record
+	} {
+		connection, err := net.Dial("tcp4", receiver.endpoint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := connection.Write(payload); err != nil {
+			connection.Close()
+			t.Fatal(err)
+		}
+		if err := connection.Close(); err != nil {
+			t.Fatal(err)
+		}
+		receiver.waitForCount(t, failure, index+1)
+	}
+
+	assertNoProcessFiles(t, receiver)
+
+	other := startPeer(t, transferlyExecutable)
+	verifyPeers(t, other, receiver)
+}
+
 func TestHostilePeerManifestPathsEndTheSessionBeforeContentIsAccepted(t *testing.T) {
 	tests := map[string]string{
 		"../escape.txt":          "traversal segment",
@@ -246,14 +273,23 @@ func TestHostilePeerManifestPathsEndTheSessionBeforeContentIsAccepted(t *testing
 			receiver.waitFor(t, reason)
 			receiver.waitFor(t, "Transfer Session ended after a connection error")
 
-			downloads := filepath.Join(receiver.homeDir, "Downloads")
-			if entries, err := os.ReadDir(downloads); err == nil && len(entries) != 0 {
-				t.Fatalf("hostile manifest wrote destination content: %v", entries)
-			} else if err != nil && !os.IsNotExist(err) {
-				t.Fatal(err)
-			}
+			assertNoProcessFiles(t, receiver)
 		})
 	}
+}
+
+func TestHostilePeerOversizedMetadataEndsTheSessionWithoutDestinationWrites(t *testing.T) {
+	receiver := startPeer(t, transferlyExecutable)
+	hostile := openHostileSession(t, receiver)
+	if err := hostile.Send(session.Message{
+		Type: "offer", OfferID: strings.Repeat("c", 32), RootCount: 1, FileCount: 100_001, TotalBytes: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	receiver.waitFor(t, "invalid or oversized Transfer Offer header")
+	receiver.waitFor(t, "Transfer Session ended after a connection error")
+
+	assertNoProcessFiles(t, receiver)
 }
 
 func TestHostilePeerUnicodeCaseAliasesAreRejected(t *testing.T) {
@@ -1483,6 +1519,19 @@ func startPeerWithArguments(t *testing.T, executable, homeDir string, arguments 
 	}
 	peer.endpoint = match[1]
 	return peer
+}
+
+func assertNoProcessFiles(t *testing.T, peer *peerProcess) {
+	t.Helper()
+	for _, directory := range []string{peer.homeDir, peer.workDir} {
+		entries, err := os.ReadDir(directory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 0 {
+			t.Fatalf("hostile traffic created filesystem content in %s: %v", directory, entries)
+		}
+	}
 }
 
 func assertFileContent(t *testing.T, path, expected string) {

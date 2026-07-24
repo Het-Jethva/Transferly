@@ -493,9 +493,13 @@ func verificationCode(state tls.ConnectionState) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return verificationCodeFromMaterial(material), nil
+}
+
+func verificationCodeFromMaterial(material []byte) string {
 	digest := sha256.Sum256(material)
 	value := binary.BigEndian.Uint32(digest[:4]) % 1_000_000
-	return fmt.Sprintf("%06d", value), nil
+	return fmt.Sprintf("%06d", value)
 }
 
 func newCredential() (tls.Certificate, error) {

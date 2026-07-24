@@ -161,6 +161,47 @@ func TestExecutableAndScriptExtensionsAreDetectedCaseInsensitively(t *testing.T)
 	}
 }
 
+func FuzzTransferOfferManifestLimits(f *testing.F) {
+	for _, seed := range [][4]int64{
+		{1, 1, 0, 0},
+		{1, maxManifestEntries, 0, 1},
+		{1, maxManifestEntries + 1, 0, 1},
+		{1, -1, 0, 1},
+		{0, 1, 0, 1},
+	} {
+		f.Add(seed[0], seed[1], seed[2], seed[3])
+	}
+	f.Fuzz(func(t *testing.T, roots, files, folders, totalBytes int64) {
+		// Header values arrive as platform ints, so clamp arbitrary fuzz values
+		// before conversion and exercise the protocol's meaningful boundary.
+		const fuzzLimit = int64(maxManifestEntries * 2)
+		clamp := func(value int64) int64 {
+			if value > fuzzLimit {
+				return fuzzLimit
+			}
+			if value < -fuzzLimit {
+				return -fuzzLimit
+			}
+			return value
+		}
+		roots, files, folders, totalBytes = clamp(roots), clamp(files), clamp(folders), clamp(totalBytes)
+		entryCount := files + folders
+		valid := roots >= 1 && roots <= maxManifestEntries && files >= 0 && folders >= 0 && entryCount >= 1 && entryCount <= maxManifestEntries && totalBytes >= 0
+
+		application := &App{}
+		current := &attempt{}
+		err := application.handleIncomingOffer(current, session.Message{
+			OfferID: strings.Repeat("a", 32), RootCount: int(roots), FileCount: int(files), FolderCount: int(folders), TotalBytes: totalBytes,
+		})
+		if valid && err != nil {
+			t.Fatalf("valid bounded header was rejected: roots=%d files=%d folders=%d bytes=%d: %v", roots, files, folders, totalBytes, err)
+		}
+		if !valid && err == nil {
+			t.Fatalf("invalid or oversized header was accepted: roots=%d files=%d folders=%d bytes=%d", roots, files, folders, totalBytes)
+		}
+	})
+}
+
 func FuzzConflictNameGeneration(f *testing.F) {
 	for _, seed := range []string{"notes.txt", "Résumé.md", "archive.tar.gz", "CON", "name. "} {
 		f.Add(seed)

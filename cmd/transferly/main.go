@@ -30,7 +30,7 @@ func main() {
 		fmt.Fprintln(output, "Usage: transferly [options]")
 		fmt.Fprintln(output, "")
 		fmt.Fprintln(output, "Start Transferly on both computers to discover Available Peers, or manually use")
-		fmt.Fprintln(output, "connect <peer-number|IPv4:port>. Compare the six-digit verification code on both")
+		fmt.Fprintln(output, "connect <peer-number|IPv4:port>, then compare the six-digit verification code on both")
 		fmt.Fprintln(output, "terminals before confirming. In a verified Transfer Session use send <path>...;")
 		fmt.Fprintln(output, "the receiving Peer can use details, destination <path>, accept, or reject.")
 		fmt.Fprintln(output, "Use cancel for an active Transfer Offer, keep-alive for an idle session,")
