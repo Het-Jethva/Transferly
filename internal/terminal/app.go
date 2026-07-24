@@ -23,13 +23,24 @@ import (
 	"github.com/Het-Jethva/Transferly/internal/session"
 )
 
-const connectTimeout = 4 * time.Second
+const (
+	connectTimeout     = 4 * time.Second
+	defaultIdleWarning = 14 * time.Minute
+	defaultIdleTimeout = 15 * time.Minute
+	maxQueuedOffers    = 64
+	messageActivity    = "activity"
+	messageKeepAlive   = "keepalive"
+)
 
 // Config contains process-lifetime settings. It is intentionally not persisted.
 type Config struct {
-	ListenAddress string
-	Version       session.Version
-	CorruptDigest bool // Used only by protocol-boundary integration builds.
+	ListenAddress    string
+	Version          session.Version
+	CorruptDigest    bool // Used only by protocol-boundary integration builds.
+	IdleWarningAfter time.Duration
+	IdleTimeoutAfter time.Duration
+	StreamChunkDelay time.Duration // Nonzero only in process-level idle tests.
+	ControllableTime bool          // Enabled only in process-level idle tests.
 }
 
 // App owns one foreground listener and at most one Transfer Session.
@@ -37,6 +48,7 @@ type App struct {
 	config   Config
 	listener net.Listener
 	output   io.Writer
+	clock    sessionClock
 
 	rootContext context.Context
 	cancelRoot  context.CancelFunc
@@ -48,18 +60,31 @@ type App struct {
 }
 
 type attempt struct {
-	context    context.Context
-	cancel     context.CancelFunc
-	remote     string
-	answer     chan bool
-	raw        net.Conn
-	secure     *session.Session
-	waiting    bool
-	stopping   bool
-	incoming   *incomingOffer
-	outgoing   *outgoingOffer
-	finished   chan struct{}
-	finishOnce sync.Once
+	context           context.Context
+	cancel            context.CancelFunc
+	remote            string
+	answer            chan bool
+	raw               net.Conn
+	secure            *session.Session
+	role              session.Role
+	waiting           bool
+	stopping          bool
+	incoming          *incomingOffer
+	outgoing          *outgoingOffer
+	outgoingQueue     []*outgoingOffer
+	coordinatorQueue  []queuedOffer
+	coordinatorActive bool
+	lastActivity      time.Time
+	idleWake          chan struct{}
+	idleWarned        bool
+	transferActive    bool
+	finished          chan struct{}
+	finishOnce        sync.Once
+}
+
+type queuedOffer struct {
+	incoming *incomingOffer
+	outgoing *outgoingOffer
 }
 
 type incomingOffer struct {
@@ -73,16 +98,19 @@ type incomingOffer struct {
 	accepted    bool
 	stagingPath string
 	stagingFile *os.File
+	reviewDone  chan struct{}
 }
 
 type outgoingOffer struct {
-	id       string
-	path     string
-	name     string
-	size     int64
-	modified time.Time
-	decision chan session.Message
-	result   chan session.Message
+	id        string
+	path      string
+	name      string
+	size      int64
+	modified  time.Time
+	decision  chan session.Message
+	result    chan session.Message
+	queued    chan bool
+	submitted bool
 }
 
 type offerAction struct {
@@ -98,6 +126,18 @@ func New(config Config, output io.Writer) (*App, error) {
 	if config.ListenAddress == "" {
 		config.ListenAddress = "0.0.0.0:0"
 	}
+	if config.IdleWarningAfter == 0 {
+		config.IdleWarningAfter = defaultIdleWarning
+	}
+	if config.IdleTimeoutAfter == 0 {
+		config.IdleTimeoutAfter = defaultIdleTimeout
+	}
+	if config.IdleWarningAfter <= 0 || config.IdleTimeoutAfter <= config.IdleWarningAfter {
+		return nil, errors.New("idle timeout must be greater than the positive idle warning duration")
+	}
+	if config.StreamChunkDelay < 0 {
+		return nil, errors.New("stream chunk delay cannot be negative")
+	}
 	if err := validateListenAddress(config.ListenAddress); err != nil {
 		return nil, err
 	}
@@ -105,11 +145,16 @@ func New(config Config, output io.Writer) (*App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen on %s: %w", config.ListenAddress, err)
 	}
+	clock := sessionClock(realSessionClock{})
+	if config.ControllableTime {
+		clock = newManualSessionClock()
+	}
 	rootContext, cancelRoot := context.WithCancel(context.Background())
 	return &App{
 		config:      config,
 		listener:    listener,
 		output:      output,
+		clock:       clock,
 		rootContext: rootContext,
 		cancelRoot:  cancelRoot,
 	}, nil
@@ -169,6 +214,10 @@ func (a *App) handleLine(line string) bool {
 	if line == "" {
 		return false
 	}
+	if a.advanceControllableTime(line) {
+		return false
+	}
+	a.noteTerminalActivity()
 	if a.answerPendingConfirmation(line) || a.answerPendingOffer(line) {
 		return false
 	}
@@ -194,6 +243,12 @@ func (a *App) handleLine(line string) bool {
 			return false
 		}
 		a.disconnect()
+	case "keep-alive":
+		if argument != "" {
+			a.line("Usage: keep-alive")
+			return false
+		}
+		a.keepAlive()
 	case "quit", "exit":
 		return true
 	case "help":
@@ -226,7 +281,7 @@ func onePathArgument(argument string) (string, bool) {
 }
 
 func (a *App) printCommands() {
-	a.line("Commands: connect <IPv4:port>, send <path>, disconnect, quit")
+	a.line("Commands: connect <IPv4:port>, send <path>, keep-alive, disconnect, quit")
 }
 
 func (a *App) answerPendingConfirmation(line string) bool {
@@ -292,7 +347,7 @@ func (a *App) answerPendingOffer(line string) bool {
 		}
 		action.kind = "destination"
 		action.destination = path
-	case "disconnect", "quit", "exit":
+	case "send", "help", "keep-alive", "disconnect", "quit", "exit":
 		return false
 	default:
 		a.line("Choose accept, reject, or destination <path> for this Transfer Offer.")
@@ -347,7 +402,10 @@ func (a *App) acceptConnections() {
 		remote := connection.RemoteAddr().String()
 		current, ok := a.beginAttempt(remote)
 		if !ok {
-			_ = connection.Close()
+			go func() {
+				_ = session.RejectBusy(a.rootContext, connection, a.config.Version)
+				_ = connection.Close()
+			}()
 			continue
 		}
 		if !a.attachConnection(current, connection) {
@@ -371,6 +429,7 @@ func (a *App) beginAttempt(remote string) (*attempt, bool) {
 		cancel:   cancel,
 		remote:   remote,
 		answer:   make(chan bool, 1),
+		idleWake: make(chan struct{}, 1),
 		finished: make(chan struct{}),
 	}
 	a.current = current
@@ -431,12 +490,16 @@ func (a *App) establish(current *attempt, connection net.Conn, role session.Role
 		return
 	}
 	current.secure = secured
+	current.role = role
 	current.waiting = false
+	current.lastActivity = a.clock.Now()
 	established = true
 	a.mu.Unlock()
 	a.line("Transfer Session verified with %s.", current.remote)
+	go a.monitorIdleSession(current)
 
 	waitError := a.serveSession(current)
+	current.cancel()
 	a.cleanupIncoming(current)
 	a.mu.Lock()
 	wasCurrent := a.current == current
@@ -444,7 +507,6 @@ func (a *App) establish(current *attempt, connection net.Conn, role session.Role
 		a.current = nil
 	}
 	a.mu.Unlock()
-	current.cancel()
 	_ = secured.Close()
 	if wasCurrent {
 		if waitError != nil {
@@ -464,10 +526,15 @@ func (a *App) serveSession(current *attempt) error {
 			}
 			return err
 		}
+		a.noteSessionActivity(current)
 		switch message.Type {
 		case "offer":
 			if err := a.handleIncomingOffer(current, message); err != nil {
 				return err
+			}
+		case "queued":
+			if !a.routeQueuedOutgoing(current, message.OfferID) {
+				return errors.New("received a queue acknowledgement for an unknown Transfer Offer")
 			}
 		case "decision":
 			if !a.routeOutgoing(current, message, true) {
@@ -483,15 +550,39 @@ func (a *App) serveSession(current *attempt) error {
 			}
 		case "abort":
 			a.abortIncoming(current, message)
+		case messageActivity:
+			if a.config.ControllableTime {
+				a.line("Test clock: Peer terminal activity observed.")
+			}
+		case messageKeepAlive:
+			a.line("Peer kept the Transfer Session alive.")
 		default:
 			return fmt.Errorf("unexpected frame %q while session is active", message.Type)
 		}
 	}
 }
 
+func (a *App) routeQueuedOutgoing(current *attempt, offerID string) bool {
+	a.mu.Lock()
+	outgoing := findOutgoingLocked(current, offerID)
+	a.mu.Unlock()
+	if outgoing == nil {
+		return false
+	}
+	select {
+	case outgoing.queued <- true:
+		return true
+	case <-current.context.Done():
+		return false
+	}
+}
+
 func (a *App) routeOutgoing(current *attempt, message session.Message, decision bool) bool {
 	a.mu.Lock()
 	outgoing := current.outgoing
+	if decision {
+		outgoing = findOutgoingLocked(current, message.OfferID)
+	}
 	if outgoing == nil || outgoing.id != message.OfferID {
 		a.mu.Unlock()
 		return false
@@ -501,6 +592,12 @@ func (a *App) routeOutgoing(current *attempt, message session.Message, decision 
 		channel = outgoing.decision
 	}
 	a.mu.Unlock()
+	if decision && message.Reason == "Transfer Offer queue is full" {
+		select {
+		case outgoing.queued <- false:
+		default:
+		}
+	}
 	select {
 	case channel <- message:
 		return true
@@ -509,17 +606,24 @@ func (a *App) routeOutgoing(current *attempt, message session.Message, decision 
 	}
 }
 
+func findOutgoingLocked(current *attempt, offerID string) *outgoingOffer {
+	if current.outgoing != nil && current.outgoing.id == offerID {
+		return current.outgoing
+	}
+	for _, outgoing := range current.outgoingQueue {
+		if outgoing.id == offerID {
+			return outgoing
+		}
+	}
+	return nil
+}
+
 func (a *App) sendFile(path string) {
 	a.mu.Lock()
 	current := a.current
 	if current == nil || current.secure == nil {
 		a.mu.Unlock()
 		a.line("Open and verify a Transfer Session before using send.")
-		return
-	}
-	if current.incoming != nil || current.outgoing != nil {
-		a.mu.Unlock()
-		a.line("A Transfer Offer is already active; finish it before sending another file.")
 		return
 	}
 	a.mu.Unlock()
@@ -557,23 +661,80 @@ func (a *App) sendFile(path string) {
 		modified: info.ModTime(),
 		decision: make(chan session.Message, 1),
 		result:   make(chan session.Message, 1),
+		queued:   make(chan bool, 1),
 	}
 
 	a.mu.Lock()
-	if a.current != current || current.secure == nil || current.incoming != nil || current.outgoing != nil {
+	if a.current != current || current.secure == nil {
 		a.mu.Unlock()
 		a.line("The Transfer Session changed before the offer could be sent; try again.")
 		return
 	}
+	if current.role == session.Inbound {
+		if len(current.coordinatorQueue) >= maxQueuedOffers {
+			a.mu.Unlock()
+			a.line("Transfer Offer queue is full; wait for an offer to finish before sending %s.", outgoing.name)
+			return
+		}
+		queued := current.coordinatorActive || len(current.coordinatorQueue) > 0
+		current.coordinatorQueue = append(current.coordinatorQueue, queuedOffer{outgoing: outgoing})
+		next := a.takeCoordinatorOfferLocked(current)
+		a.mu.Unlock()
+		if queued {
+			a.line("Transfer Offer queued: %s (%d bytes).", outgoing.name, outgoing.size)
+		}
+		a.startCoordinatorOffer(current, next)
+		return
+	}
+	if current.outgoing != nil {
+		if len(current.outgoingQueue) >= maxQueuedOffers {
+			a.mu.Unlock()
+			a.line("Transfer Offer queue is full; wait for an offer to finish before sending %s.", outgoing.name)
+			return
+		}
+		outgoing.submitted = true
+		current.outgoingQueue = append(current.outgoingQueue, outgoing)
+		secured := current.secure
+		a.mu.Unlock()
+		if err := secured.Send(offerMessage(outgoing)); err != nil {
+			a.line("Could not queue Transfer Offer %s: %v", outgoing.name, err)
+			_ = secured.Close()
+			return
+		}
+		select {
+		case queued := <-outgoing.queued:
+			if queued {
+				a.line("Transfer Offer queued: %s (%d bytes).", outgoing.name, outgoing.size)
+			} else {
+				a.line("Peer could not queue Transfer Offer %s.", outgoing.name)
+			}
+		case <-current.context.Done():
+		}
+		return
+	}
+	outgoing.submitted = true
 	current.outgoing = outgoing
+	secured := current.secure
 	a.mu.Unlock()
+	if err := secured.Send(offerMessage(outgoing)); err != nil {
+		a.failOutgoing(current, outgoing, "Could not send Transfer Offer: %v", err)
+		_ = secured.Close()
+		return
+	}
 	go a.runOutgoing(current, outgoing)
 }
 
+func offerMessage(outgoing *outgoingOffer) session.Message {
+	return session.Message{Type: "offer", OfferID: outgoing.id, Name: outgoing.name, Size: outgoing.size}
+}
+
 func (a *App) runOutgoing(current *attempt, outgoing *outgoingOffer) {
-	if err := current.secure.Send(session.Message{Type: "offer", OfferID: outgoing.id, Name: outgoing.name, Size: outgoing.size}); err != nil {
-		a.failOutgoing(current, outgoing, "Could not send Transfer Offer: %v", err)
-		return
+	if !outgoing.submitted {
+		if err := current.secure.Send(offerMessage(outgoing)); err != nil {
+			a.failOutgoing(current, outgoing, "Could not send Transfer Offer: %v", err)
+			return
+		}
+		outgoing.submitted = true
 	}
 	a.line("Transfer Offer sent: %s (%d bytes). Waiting for the Peer.", outgoing.name, outgoing.size)
 
@@ -593,6 +754,7 @@ func (a *App) runOutgoing(current *attempt, outgoing *outgoingOffer) {
 		return
 	}
 
+	a.startTransfer(current)
 	source, err := os.Open(outgoing.path)
 	if err != nil {
 		_ = current.secure.Send(session.Message{Type: "abort", OfferID: outgoing.id, Reason: "source could not be opened"})
@@ -608,21 +770,26 @@ func (a *App) runOutgoing(current *attempt, outgoing *outgoingOffer) {
 	}
 
 	progress := a.progress("Sending "+outgoing.name, outgoing.size)
-	digest, streamError := current.secure.SendStream(current.context, session.Message{
+	var sourceReader io.Reader = source
+	if a.config.StreamChunkDelay > 0 {
+		sourceReader = &delayedReader{context: current.context, source: source, delay: a.config.StreamChunkDelay}
+	}
+	_, streamError := current.secure.SendStream(current.context, session.Message{
 		Type: "content", OfferID: outgoing.id, Size: outgoing.size,
-	}, source, outgoing.size, progress)
-	after, statError := source.Stat()
+	}, sourceReader, outgoing.size, progress, func(digest string) (session.Message, error) {
+		after, err := source.Stat()
+		if err != nil || after.Size() != outgoing.size || !after.ModTime().Equal(outgoing.modified) {
+			return session.Message{}, errors.New("source changed while it was being read")
+		}
+		if a.config.CorruptDigest {
+			digest = corruptSHA256(digest)
+		}
+		return session.Message{Type: "complete", OfferID: outgoing.id, Size: outgoing.size, Digest: digest}, nil
+	})
 	closeError := source.Close()
-	if streamError != nil || statError != nil || closeError != nil || after.Size() != outgoing.size || !after.ModTime().Equal(outgoing.modified) {
+	if streamError != nil || closeError != nil {
 		a.failOutgoing(current, outgoing, "Transfer failed for %s because the source changed or could not be read completely.", outgoing.name)
 		_ = current.secure.Close()
-		return
-	}
-	if a.config.CorruptDigest {
-		digest = corruptSHA256(digest)
-	}
-	if err := current.secure.Send(session.Message{Type: "complete", OfferID: outgoing.id, Size: outgoing.size, Digest: digest}); err != nil {
-		a.failOutgoing(current, outgoing, "Transfer failed for %s while sending its integrity result: %v", outgoing.name, err)
 		return
 	}
 
@@ -644,6 +811,23 @@ func (a *App) runOutgoing(current *attempt, outgoing *outgoingOffer) {
 	a.line("Transfer complete: %s (%d bytes).", outgoing.name, outgoing.size)
 }
 
+type delayedReader struct {
+	context context.Context
+	source  io.Reader
+	delay   time.Duration
+}
+
+func (r *delayedReader) Read(destination []byte) (int, error) {
+	timer := time.NewTimer(r.delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return r.source.Read(destination)
+	case <-r.context.Done():
+		return 0, r.context.Err()
+	}
+}
+
 func (a *App) failOutgoing(current *attempt, outgoing *outgoingOffer, format string, arguments ...any) {
 	a.clearOutgoing(current, outgoing)
 	a.line(format, arguments...)
@@ -651,10 +835,35 @@ func (a *App) failOutgoing(current *attempt, outgoing *outgoingOffer, format str
 
 func (a *App) clearOutgoing(current *attempt, outgoing *outgoingOffer) {
 	a.mu.Lock()
-	if current.outgoing == outgoing {
-		current.outgoing = nil
+	if current.outgoing != outgoing {
+		a.mu.Unlock()
+		return
 	}
+	a.finishTransferLocked(current)
+	if current.role == session.Inbound {
+		current.outgoing = nil
+		current.coordinatorActive = false
+		next := a.takeCoordinatorOfferLocked(current)
+		a.mu.Unlock()
+		a.startCoordinatorOffer(current, next)
+		return
+	}
+	current.outgoing = nil
+	next := a.takeNextOutgoingLocked(current)
 	a.mu.Unlock()
+	if next != nil {
+		go a.runOutgoing(current, next)
+	}
+}
+
+func (a *App) takeNextOutgoingLocked(current *attempt) *outgoingOffer {
+	if current.incoming != nil || current.outgoing != nil || len(current.outgoingQueue) == 0 {
+		return nil
+	}
+	next := current.outgoingQueue[0]
+	current.outgoingQueue = current.outgoingQueue[1:]
+	current.outgoing = next
+	return next
 }
 
 func (a *App) handleIncomingOffer(current *attempt, message session.Message) error {
@@ -680,15 +889,33 @@ func (a *App) handleIncomingOffer(current *attempt, message session.Message) err
 	}
 
 	a.mu.Lock()
-	if current.incoming != nil || current.outgoing != nil {
+	if current.role == session.Inbound {
+		if len(current.coordinatorQueue) >= maxQueuedOffers {
+			a.mu.Unlock()
+			accepted := false
+			return current.secure.Send(session.Message{Type: "decision", OfferID: incoming.id, Accepted: &accepted, Reason: "Transfer Offer queue is full"})
+		}
+		current.coordinatorQueue = append(current.coordinatorQueue, queuedOffer{incoming: incoming})
+		next := a.takeCoordinatorOfferLocked(current)
 		a.mu.Unlock()
-		accepted := false
-		return current.secure.Send(session.Message{Type: "decision", OfferID: message.OfferID, Accepted: &accepted, Reason: "another Transfer Offer is active"})
+		if err := current.secure.Send(session.Message{Type: "queued", OfferID: incoming.id}); err != nil {
+			return err
+		}
+		a.startCoordinatorOffer(current, next)
+		return nil
+	}
+	if current.incoming != nil {
+		a.mu.Unlock()
+		return errors.New("coordinating Peer sent overlapping Transfer Offers")
 	}
 	current.incoming = incoming
 	a.mu.Unlock()
-	a.showIncoming(incoming)
+	a.startIncomingReview(current, incoming)
+	return nil
+}
 
+func (a *App) reviewIncomingOffer(current *attempt, incoming *incomingOffer) error {
+	a.showIncoming(incoming)
 	for {
 		select {
 		case action := <-incoming.actions:
@@ -728,9 +955,11 @@ func (a *App) handleIncomingOffer(current *attempt, message session.Message) err
 				incoming.waiting = false
 				incoming.accepted = true
 				a.mu.Unlock()
+				a.startTransfer(current)
 				accepted := true
 				if err := current.secure.Send(session.Message{Type: "decision", OfferID: incoming.id, Accepted: &accepted}); err != nil {
-					a.cleanupIncoming(current)
+					a.removeIncomingFiles(incoming)
+					a.clearIncoming(current, incoming)
 					return err
 				}
 				a.line("Transfer Offer accepted. Waiting for file content.")
@@ -846,17 +1075,81 @@ func (a *App) abortIncoming(current *attempt, message session.Message) {
 
 func (a *App) clearIncoming(current *attempt, incoming *incomingOffer) {
 	a.mu.Lock()
-	if current.incoming == incoming {
-		current.incoming = nil
+	if current.incoming != incoming {
+		a.mu.Unlock()
+		return
 	}
+	a.finishTransferLocked(current)
+	current.incoming = nil
+	if current.role == session.Inbound {
+		current.coordinatorActive = false
+		next := a.takeCoordinatorOfferLocked(current)
+		a.mu.Unlock()
+		a.startCoordinatorOffer(current, next)
+		return
+	}
+	next := a.takeNextOutgoingLocked(current)
 	a.mu.Unlock()
+	if next != nil {
+		go a.runOutgoing(current, next)
+	}
+}
+
+func (a *App) takeCoordinatorOfferLocked(current *attempt) *queuedOffer {
+	if current.role != session.Inbound || current.coordinatorActive || len(current.coordinatorQueue) == 0 {
+		return nil
+	}
+	next := current.coordinatorQueue[0]
+	current.coordinatorQueue = current.coordinatorQueue[1:]
+	current.coordinatorActive = true
+	if next.incoming != nil {
+		current.incoming = next.incoming
+	} else {
+		current.outgoing = next.outgoing
+	}
+	return &next
+}
+
+func (a *App) startCoordinatorOffer(current *attempt, next *queuedOffer) {
+	if next == nil {
+		return
+	}
+	if next.incoming != nil {
+		a.startIncomingReview(current, next.incoming)
+		return
+	}
+	go a.runOutgoing(current, next.outgoing)
+}
+
+func (a *App) startIncomingReview(current *attempt, incoming *incomingOffer) {
+	a.mu.Lock()
+	if current.incoming != incoming {
+		a.mu.Unlock()
+		return
+	}
+	done := make(chan struct{})
+	incoming.reviewDone = done
+	a.mu.Unlock()
+	go func() {
+		defer close(done)
+		if err := a.reviewIncomingOffer(current, incoming); err != nil && !errors.Is(err, context.Canceled) {
+			_ = current.secure.Close()
+		}
+	}()
 }
 
 func (a *App) cleanupIncoming(current *attempt) {
 	a.mu.Lock()
 	incoming := current.incoming
 	current.incoming = nil
+	var reviewDone <-chan struct{}
+	if incoming != nil {
+		reviewDone = incoming.reviewDone
+	}
 	a.mu.Unlock()
+	if reviewDone != nil {
+		<-reviewDone
+	}
 	if incoming != nil {
 		a.removeIncomingFiles(incoming)
 	}
@@ -953,6 +1246,8 @@ func (a *App) reportSessionError(remote string, err error) {
 		a.line("Verification did not match; connection closed.")
 	case errors.Is(err, session.ErrPeerRejected):
 		a.line("Peer rejected verification; connection closed.")
+	case errors.Is(err, session.ErrPeerBusy):
+		a.line("%v.", err)
 	case errors.As(err, &versionError):
 		a.line("Incompatible wire protocol: local %s, Peer %s. Install compatible Transferly releases.", versionError.Local, versionError.Peer)
 	case errors.Is(err, context.Canceled):

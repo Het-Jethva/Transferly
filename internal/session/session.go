@@ -53,6 +53,7 @@ type Confirm func(context.Context, string) (bool, error)
 var (
 	ErrLocalRejected = errors.New("local user rejected verification")
 	ErrPeerRejected  = errors.New("Peer rejected verification")
+	ErrPeerBusy      = errors.New("Peer is busy with another active or pending Transfer Session")
 )
 
 // VersionError reports an incompatible wire-protocol major version.
@@ -94,11 +95,67 @@ type Progress func(completed int64)
 // protocol, and waits for both human confirmations. Credentials exist only in
 // memory and are generated anew on every call.
 func Open(ctx context.Context, raw net.Conn, role Role, version Version, confirm Confirm) (*Session, error) {
-	credential, err := newCredential()
+	protected, reader, state, err := protectAndNegotiate(ctx, raw, role, version)
 	if err != nil {
-		return nil, fmt.Errorf("generate temporary credential: %w", err)
+		return nil, err
+	}
+	opened := false
+	defer func() {
+		if !opened {
+			_ = protected.Close()
+		}
+	}()
+	if err := exchangeAvailability(protected, reader, role); err != nil {
+		return nil, err
 	}
 
+	code, err := verificationCode(state)
+	if err != nil {
+		return nil, fmt.Errorf("derive verification code: %w", err)
+	}
+	if err := exchangeConfirmation(ctx, protected, reader, code, confirm); err != nil {
+		return nil, err
+	}
+
+	opened = true
+	return &Session{connection: protected, reader: reader}, nil
+}
+
+// RejectBusy securely rejects an additional connection before human
+// verification. The busy outcome contains no identity, offer, or file metadata.
+func RejectBusy(ctx context.Context, raw net.Conn, version Version) error {
+	protected, _, _, err := protectAndNegotiate(ctx, raw, Inbound, version)
+	if err != nil {
+		return err
+	}
+	defer protected.Close()
+	available := false
+	return writeFrame(protected, wireMessage{Type: "availability", Accepted: &available})
+}
+
+func exchangeAvailability(connection net.Conn, reader *bufio.Reader, role Role) error {
+	if role == Inbound {
+		available := true
+		return writeFrame(connection, wireMessage{Type: "availability", Accepted: &available})
+	}
+	message, err := readWireFrame(reader)
+	if err != nil {
+		return fmt.Errorf("read Peer availability: %w", err)
+	}
+	if message.Type != "availability" || message.Accepted == nil {
+		return fmt.Errorf("expected Peer availability, received %q", message.Type)
+	}
+	if !*message.Accepted {
+		return ErrPeerBusy
+	}
+	return nil
+}
+
+func protectAndNegotiate(ctx context.Context, raw net.Conn, role Role, version Version) (*tls.Conn, *bufio.Reader, tls.ConnectionState, error) {
+	credential, err := newCredential()
+	if err != nil {
+		return nil, nil, tls.ConnectionState{}, fmt.Errorf("generate temporary credential: %w", err)
+	}
 	configuration := &tls.Config{
 		Certificates: []tls.Certificate{credential},
 		MinVersion:   tls.VersionTLS13,
@@ -112,48 +169,35 @@ func Open(ctx context.Context, raw net.Conn, role Role, version Version, confirm
 		configuration.ClientAuth = tls.RequireAnyClientCert
 		protected = tls.Server(raw, configuration)
 	}
-	opened := false
-	defer func() {
-		if !opened {
-			_ = protected.Close()
-		}
-	}()
+	fail := func(err error) (*tls.Conn, *bufio.Reader, tls.ConnectionState, error) {
+		_ = protected.Close()
+		return nil, nil, tls.ConnectionState{}, err
+	}
 
 	handshakeContext, cancelHandshake := context.WithTimeout(ctx, handshakeTimeout)
 	defer cancelHandshake()
 	if err := protected.HandshakeContext(handshakeContext); err != nil {
-		return nil, fmt.Errorf("TLS 1.3 handshake: %w", err)
+		return fail(fmt.Errorf("TLS 1.3 handshake: %w", err))
 	}
 	state := protected.ConnectionState()
 	if state.Version != tls.VersionTLS13 || len(state.PeerCertificates) == 0 {
-		return nil, errors.New("Peer did not establish mutually authenticated TLS 1.3")
+		return fail(errors.New("Peer did not establish mutually authenticated TLS 1.3"))
 	}
-
 	reader := bufio.NewReaderSize(protected, maximumFrameBytes)
 	if err := writeFrame(protected, wireMessage{Type: "hello", Version: version}); err != nil {
-		return nil, fmt.Errorf("send protocol version: %w", err)
+		return fail(fmt.Errorf("send protocol version: %w", err))
 	}
 	peerHello, err := readWireFrame(reader)
 	if err != nil {
-		return nil, fmt.Errorf("read protocol version: %w", err)
+		return fail(fmt.Errorf("read protocol version: %w", err))
 	}
 	if peerHello.Type != "hello" {
-		return nil, fmt.Errorf("expected protocol hello, received %q", peerHello.Type)
+		return fail(fmt.Errorf("expected protocol hello, received %q", peerHello.Type))
 	}
 	if peerHello.Version.Major != version.Major {
-		return nil, &VersionError{Local: version, Peer: peerHello.Version}
+		return fail(&VersionError{Local: version, Peer: peerHello.Version})
 	}
-
-	code, err := verificationCode(state)
-	if err != nil {
-		return nil, fmt.Errorf("derive verification code: %w", err)
-	}
-	if err := exchangeConfirmation(ctx, protected, reader, code, confirm); err != nil {
-		return nil, err
-	}
-
-	opened = true
-	return &Session{connection: protected, reader: reader}, nil
+	return protected, reader, state, nil
 }
 
 // Send writes one bounded control message to the verified Peer.
@@ -170,11 +214,18 @@ func (s *Session) Receive() (Message, error) {
 	return message, err
 }
 
-// SendStream writes a content header followed by exactly size bytes while
-// computing SHA-256 with a fixed-size buffer.
-func (s *Session) SendStream(ctx context.Context, header Message, source io.Reader, size int64, progress Progress) (string, error) {
+// StreamCompletion builds the completion frame while the stream keeps
+// exclusive ownership of the write side of the connection.
+type StreamCompletion func(digest string) (Message, error)
+
+// SendStream writes a content header, exactly size bytes, and its completion
+// frame as one ordered sequence while computing SHA-256 with a fixed buffer.
+func (s *Session) SendStream(ctx context.Context, header Message, source io.Reader, size int64, progress Progress, complete StreamCompletion) (string, error) {
 	if size < 0 {
 		return "", errors.New("stream size cannot be negative")
+	}
+	if complete == nil {
+		return "", errors.New("stream completion is required")
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -185,7 +236,15 @@ func (s *Session) SendStream(ctx context.Context, header Message, source io.Read
 	if err := copyStream(ctx, io.MultiWriter(s.connection, hash), source, size, progress); err != nil {
 		return "", err
 	}
-	return hex.EncodeToString(hash.Sum(nil)), nil
+	digest := hex.EncodeToString(hash.Sum(nil))
+	completion, err := complete(digest)
+	if err != nil {
+		return digest, err
+	}
+	if err := writeFrame(s.connection, completion); err != nil {
+		return digest, err
+	}
+	return digest, nil
 }
 
 // ReceiveStream reads exactly size bytes from the current content frame into

@@ -23,6 +23,8 @@ var (
 	transferlyExecutable             string
 	incompatibleTransferlyExecutable string
 	corruptDigestExecutable          string
+	shortIdleExecutable              string
+	slowIdleExecutable               string
 )
 
 func TestMain(m *testing.M) {
@@ -46,16 +48,26 @@ func TestMain(m *testing.M) {
 	transferlyExecutable = filepath.Join(tempDir, "transferly"+extension)
 	incompatibleTransferlyExecutable = filepath.Join(tempDir, "transferly-v2"+extension)
 	corruptDigestExecutable = filepath.Join(tempDir, "transferly-corrupt-digest"+extension)
+	shortIdleExecutable = filepath.Join(tempDir, "transferly-short-idle"+extension)
+	slowIdleExecutable = filepath.Join(tempDir, "transferly-slow-idle"+extension)
 
 	if err := buildExecutable(transferlyExecutable); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	if err := buildExecutable(incompatibleTransferlyExecutable, "-ldflags", "-X main.wireMajor=2"); err != nil {
+	if err := buildExecutable(incompatibleTransferlyExecutable, "-ldflags", "-X main.wireMajor=1"); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 	if err := buildExecutable(corruptDigestExecutable, "-ldflags", "-X main.corruptDigest=true"); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := buildExecutable(shortIdleExecutable, "-ldflags", "-X main.controllableTime=true"); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := buildExecutable(slowIdleExecutable, "-ldflags", "-X main.controllableTime=true -X main.streamChunkDelay=40ms"); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -350,6 +362,251 @@ func TestRejectedFileWritesNothingAndLeavesTheSessionActive(t *testing.T) {
 	receiver.send(t, "reject")
 }
 
+func TestSimultaneousBidirectionalOffersAreSerialized(t *testing.T) {
+	first := startPeer(t, transferlyExecutable)
+	second := startPeer(t, transferlyExecutable)
+	verifyPeers(t, first, second)
+
+	firstSource := filepath.Join(t.TempDir(), "from-first.txt")
+	secondSource := filepath.Join(t.TempDir(), "from-second.txt")
+	if err := os.WriteFile(firstSource, []byte("first Peer"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(secondSource, []byte("second Peer"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	first.send(t, "send "+firstSource)
+	second.send(t, "send "+secondSource)
+
+	firstOffer := "Transfer Offer: from-second.txt"
+	secondOffer := "Transfer Offer: from-first.txt"
+	firstPresented := waitForEither(t, first, firstOffer, second, secondOffer)
+	if firstPresented {
+		first.send(t, "accept")
+		first.waitFor(t, "Received from-second.txt")
+		second.waitFor(t, secondOffer)
+		second.send(t, "accept")
+	} else {
+		second.send(t, "accept")
+		second.waitFor(t, "Received from-first.txt")
+		first.waitFor(t, firstOffer)
+		first.send(t, "accept")
+	}
+	first.waitFor(t, "Received from-second.txt")
+	second.waitFor(t, "Received from-first.txt")
+
+	if bytes, err := os.ReadFile(filepath.Join(first.homeDir, "Downloads", "from-second.txt")); err != nil || string(bytes) != "second Peer" {
+		t.Fatalf("first Peer destination: bytes=%q err=%v", bytes, err)
+	}
+	if bytes, err := os.ReadFile(filepath.Join(second.homeDir, "Downloads", "from-first.txt")); err != nil || string(bytes) != "first Peer" {
+		t.Fatalf("second Peer destination: bytes=%q err=%v", bytes, err)
+	}
+}
+
+func TestSendingAndReceivingRolesAlternateWithoutReconnecting(t *testing.T) {
+	first := startPeer(t, transferlyExecutable)
+	second := startPeer(t, transferlyExecutable)
+	verifyPeers(t, first, second)
+
+	firstSource := filepath.Join(t.TempDir(), "first-to-second.txt")
+	secondSource := filepath.Join(t.TempDir(), "second-to-first.txt")
+	if err := os.WriteFile(firstSource, []byte("forward"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(secondSource, []byte("backward"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	first.send(t, "send "+firstSource)
+	second.waitFor(t, "Transfer Offer: first-to-second.txt")
+	second.send(t, "accept")
+	first.waitFor(t, "Transfer complete: first-to-second.txt")
+
+	second.send(t, "send "+secondSource)
+	first.waitFor(t, "Transfer Offer: second-to-first.txt")
+	first.send(t, "accept")
+	second.waitFor(t, "Transfer complete: second-to-first.txt")
+}
+
+func TestLaterTransferOffersWaitInSubmissionOrder(t *testing.T) {
+	sender := startPeer(t, transferlyExecutable)
+	receiver := startPeer(t, transferlyExecutable)
+	verifyPeers(t, sender, receiver)
+
+	directory := t.TempDir()
+	first := filepath.Join(directory, "first.txt")
+	second := filepath.Join(directory, "second.txt")
+	third := filepath.Join(directory, "third.txt")
+	for path, content := range map[string]string{
+		first: "first", second: "second", third: "third",
+	} {
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sender.send(t, "send "+first)
+	receiver.waitFor(t, "Transfer Offer: first.txt")
+	sender.send(t, "send "+second)
+	sender.waitFor(t, "Transfer Offer queued: second.txt")
+	sender.send(t, "send "+third)
+	sender.waitFor(t, "Transfer Offer queued: third.txt")
+	if receiver.contains("Transfer Offer: second.txt") || receiver.contains("Transfer Offer: third.txt") {
+		t.Fatal("a later Transfer Offer was presented before the active offer completed")
+	}
+
+	receiver.send(t, "accept")
+	receiver.waitFor(t, "Received first.txt")
+	receiver.waitFor(t, "Transfer Offer: second.txt")
+	receiver.send(t, "reject")
+	sender.waitFor(t, "Peer rejected Transfer Offer second.txt")
+	receiver.waitFor(t, "Transfer Offer: third.txt")
+	receiver.send(t, "accept")
+	receiver.waitFor(t, "Received third.txt")
+
+	downloads := filepath.Join(receiver.homeDir, "Downloads")
+	for _, name := range []string{"first.txt", "third.txt"} {
+		if _, err := os.Stat(filepath.Join(downloads, name)); err != nil {
+			t.Fatalf("queued offer %s was not published: %v", name, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(downloads, "second.txt")); !os.IsNotExist(err) {
+		t.Fatalf("rejected queued offer was published: %v", err)
+	}
+}
+
+func TestTransferOfferQueuePreservesOrderAcrossPeers(t *testing.T) {
+	first := startPeer(t, transferlyExecutable)
+	coordinator := startPeer(t, transferlyExecutable)
+	verifyPeers(t, first, coordinator)
+
+	directory := t.TempDir()
+	active := filepath.Join(directory, "active-from-first.txt")
+	earlier := filepath.Join(directory, "earlier-from-first.txt")
+	later := filepath.Join(directory, "later-from-coordinator.txt")
+	for _, path := range []string{active, earlier, later} {
+		if err := os.WriteFile(path, []byte(filepath.Base(path)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	first.send(t, "send "+active)
+	coordinator.waitFor(t, "Transfer Offer: active-from-first.txt")
+	first.send(t, "send "+earlier)
+	first.waitFor(t, "Transfer Offer queued: earlier-from-first.txt")
+	coordinator.send(t, "send "+later)
+	coordinator.waitFor(t, "Transfer Offer queued: later-from-coordinator.txt")
+
+	coordinator.send(t, "reject")
+	coordinator.waitFor(t, "Transfer Offer: earlier-from-first.txt")
+	if first.contains("Transfer Offer: later-from-coordinator.txt") {
+		t.Fatal("a later offer from the coordinating Peer overtook an earlier queued offer")
+	}
+	coordinator.send(t, "reject")
+	first.waitFor(t, "Transfer Offer: later-from-coordinator.txt")
+	first.send(t, "reject")
+}
+
+func TestQueuedOfferIsAcknowledgedAcrossCompletionBoundary(t *testing.T) {
+	sender := startPeer(t, slowIdleExecutable)
+	receiver := startPeer(t, transferlyExecutable)
+	verifyPeers(t, sender, receiver)
+
+	directory := t.TempDir()
+	active := filepath.Join(directory, "slow-active.bin")
+	queued := filepath.Join(directory, "after-completion.txt")
+	if err := os.WriteFile(active, make([]byte, 1024*1024), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(queued, []byte("next"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sender.send(t, "send "+active)
+	receiver.waitFor(t, "Transfer Offer: slow-active.bin")
+	receiver.send(t, "accept")
+	receiver.waitFor(t, "Receiving slow-active.bin: 0/1048576 bytes")
+	sender.send(t, "send "+queued)
+	sender.waitFor(t, "Transfer Offer queued: after-completion.txt")
+	receiver.waitFor(t, "Received slow-active.bin")
+	receiver.waitFor(t, "Transfer Offer: after-completion.txt")
+	receiver.send(t, "reject")
+}
+
+func TestTransferOfferQueueHasABoundedCapacity(t *testing.T) {
+	sender := startPeer(t, transferlyExecutable)
+	receiver := startPeer(t, transferlyExecutable)
+	verifyPeers(t, sender, receiver)
+
+	sourcePath := filepath.Join(t.TempDir(), "bounded.txt")
+	if err := os.WriteFile(sourcePath, []byte("bounded"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sender.send(t, "send "+sourcePath)
+	receiver.waitFor(t, "Transfer Offer: bounded.txt")
+	for index := 0; index < 64; index++ {
+		sender.send(t, "send "+sourcePath)
+	}
+	sender.waitForCount(t, "Transfer Offer queued: bounded.txt", 64)
+	sender.send(t, "send "+sourcePath)
+	sender.waitFor(t, "Transfer Offer queue is full")
+}
+
+func TestDisconnectDuringOfferAcceptanceCleansStaging(t *testing.T) {
+	sender := startPeer(t, slowIdleExecutable)
+	receiver := startPeer(t, transferlyExecutable)
+	verifyPeers(t, sender, receiver)
+
+	sourcePath := filepath.Join(t.TempDir(), "disconnecting.bin")
+	if err := os.WriteFile(sourcePath, make([]byte, 1024*1024), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sender.send(t, "send "+sourcePath)
+	receiver.waitFor(t, "Transfer Offer: disconnecting.bin")
+	receiver.send(t, "accept")
+	receiver.send(t, "disconnect")
+	receiver.waitFor(t, "Transfer Session ended.")
+	sender.waitFor(t, "Transfer Session ended.")
+
+	downloads := filepath.Join(receiver.homeDir, "Downloads")
+	if _, err := os.Stat(filepath.Join(downloads, ".transferly-staging")); !os.IsNotExist(err) {
+		t.Fatalf("staging remained after disconnect raced offer acceptance: %v", err)
+	}
+}
+
+func TestQueuedOffersDisappearWhenTheTransferSessionEnds(t *testing.T) {
+	sender := startPeer(t, transferlyExecutable)
+	receiver := startPeer(t, transferlyExecutable)
+	verifyPeers(t, sender, receiver)
+
+	directory := t.TempDir()
+	active := filepath.Join(directory, "active.txt")
+	queued := filepath.Join(directory, "queued.txt")
+	fresh := filepath.Join(directory, "fresh.txt")
+	for _, path := range []string{active, queued, fresh} {
+		if err := os.WriteFile(path, []byte(filepath.Base(path)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sender.send(t, "send "+active)
+	receiver.waitFor(t, "Transfer Offer: active.txt")
+	sender.send(t, "send "+queued)
+	sender.waitFor(t, "Transfer Offer queued: queued.txt")
+	sender.send(t, "disconnect")
+	sender.waitFor(t, "Transfer Session ended.")
+	receiver.waitFor(t, "Transfer Session ended.")
+
+	verifyPeers(t, sender, receiver)
+	sender.send(t, "send "+fresh)
+	receiver.waitFor(t, "Transfer Offer: fresh.txt")
+	if receiver.contains("Transfer Offer: queued.txt") {
+		t.Fatal("a queued Transfer Offer survived the previous Transfer Session")
+	}
+	receiver.send(t, "reject")
+}
+
 func TestPeersVerifyDisconnectAndVerifyAgain(t *testing.T) {
 	first := startPeer(t, transferlyExecutable)
 	second := startPeer(t, transferlyExecutable)
@@ -387,12 +644,114 @@ func TestIncompatibleProtocolMajorIsRejectedBeforeVerification(t *testing.T) {
 	second := startPeer(t, incompatibleTransferlyExecutable)
 
 	first.send(t, "connect "+second.endpoint)
-	first.waitFor(t, "Incompatible wire protocol: local 1.0, Peer 2.0")
-	second.waitFor(t, "Incompatible wire protocol: local 2.0, Peer 1.0")
+	first.waitFor(t, "Incompatible wire protocol: local 2.0, Peer 1.0")
+	second.waitFor(t, "Incompatible wire protocol: local 1.0, Peer 2.0")
 
 	if first.contains("Verification code:") || second.contains("Verification code:") {
 		t.Fatal("an incompatible connection reached human verification")
 	}
+}
+
+func TestActiveTransferIsExemptFromIdleExpiry(t *testing.T) {
+	sender := startPeer(t, slowIdleExecutable)
+	receiver := startPeer(t, slowIdleExecutable)
+
+	sourcePath := filepath.Join(t.TempDir(), "deliberately-slow.bin")
+	if err := os.WriteFile(sourcePath, make([]byte, 1024*1024), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	verifyPeers(t, sender, receiver)
+	sender.send(t, "send "+sourcePath)
+	receiver.waitFor(t, "Transfer Offer: deliberately-slow.bin")
+	receiver.send(t, "accept")
+	receiver.waitFor(t, "Receiving deliberately-slow.bin: 0/1048576 bytes")
+	sender.send(t, "advance-time 1h")
+	receiver.send(t, "advance-time 1h")
+	sender.waitFor(t, "Transfer complete: deliberately-slow.bin")
+	receiver.waitFor(t, "Received deliberately-slow.bin")
+
+	if sender.contains("Transfer Session expired") || receiver.contains("Transfer Session expired") {
+		t.Fatal("an active Transfer Offer expired for session idleness")
+	}
+	sender.send(t, "advance-time 15m")
+	receiver.send(t, "advance-time 15m")
+	waitForEither(t, sender, "Transfer Session expired after 15m0s", receiver, "Transfer Session expired after 15m0s")
+}
+
+func TestIdleWarningKeepAliveAndExpiryUseControllableTime(t *testing.T) {
+	first := startPeer(t, shortIdleExecutable)
+	second := startPeer(t, shortIdleExecutable)
+	verifyPeers(t, first, second)
+
+	warning := "Transfer Session idle for 14m0s"
+	first.send(t, "advance-time 14m")
+	second.send(t, "advance-time 14m")
+	first.waitFor(t, warning)
+	second.waitFor(t, warning)
+
+	commandsBefore := first.count("Commands: connect")
+	first.send(t, "help")
+	first.waitForCount(t, "Commands: connect", commandsBefore+1)
+	second.waitFor(t, "Test clock: Peer terminal activity observed.")
+	firstWarnings := first.count(warning)
+	secondWarnings := second.count(warning)
+	first.send(t, "advance-time 14m")
+	second.send(t, "advance-time 14m")
+	first.waitForCount(t, warning, firstWarnings+1)
+	second.waitForCount(t, warning, secondWarnings+1)
+	if first.contains("Transfer Session ended.") || second.contains("Transfer Session ended.") {
+		t.Fatal("the Peer expired despite terminal activity in the Transfer Session")
+	}
+
+	first.send(t, "keep-alive")
+	first.waitFor(t, "Transfer Session kept alive.")
+	second.waitFor(t, "Peer kept the Transfer Session alive.")
+	firstWarnings = first.count(warning)
+	secondWarnings = second.count(warning)
+	first.send(t, "advance-time 14m")
+	second.send(t, "advance-time 14m")
+	first.waitForCount(t, warning, firstWarnings+1)
+	second.waitForCount(t, warning, secondWarnings+1)
+	if first.contains("Transfer Session ended.") || second.contains("Transfer Session ended.") {
+		t.Fatal("the Transfer Session expired before the keep-alive interval elapsed")
+	}
+
+	first.send(t, "advance-time 1m")
+	second.send(t, "advance-time 1m")
+	expired := "Transfer Session expired after 15m0s without activity"
+	waitForEither(t, first, expired, second, expired)
+	first.waitFor(t, "Transfer Session ended.")
+	second.waitFor(t, "Transfer Session ended.")
+
+	verifyPeers(t, first, second)
+}
+
+func TestAdditionalConnectionsReceiveAClearBusyOutcome(t *testing.T) {
+	first := startPeer(t, transferlyExecutable)
+	second := startPeer(t, transferlyExecutable)
+	additional := startPeer(t, transferlyExecutable)
+
+	first.send(t, "connect "+second.endpoint)
+	firstCode := first.waitForCode(t, 0)
+	secondCode := second.waitForCode(t, 0)
+	if firstCode != secondCode {
+		t.Fatalf("Peers displayed different verification codes: %s and %s", firstCode, secondCode)
+	}
+
+	additional.send(t, "connect "+second.endpoint)
+	additional.waitFor(t, "Peer is busy with another active or pending Transfer Session")
+	if additional.contains("Verification code:") {
+		t.Fatal("a busy connection created verification state")
+	}
+
+	first.send(t, "yes")
+	second.send(t, "yes")
+	first.waitFor(t, "Transfer Session verified")
+	second.waitFor(t, "Transfer Session verified")
+
+	busyBefore := additional.count("Peer is busy with another active or pending Transfer Session")
+	additional.send(t, "connect "+second.endpoint)
+	additional.waitForCount(t, "Peer is busy with another active or pending Transfer Session", busyBefore+1)
 }
 
 func TestConnectionErrorsLeaveThePeerAvailable(t *testing.T) {
@@ -528,6 +887,27 @@ func (p *peerProcess) send(t *testing.T, line string) {
 	t.Helper()
 	if _, err := io.WriteString(p.stdin, line+"\n"); err != nil {
 		t.Fatalf("send %q: %v\noutput:\n%s", line, err, p.snapshot())
+	}
+}
+
+func waitForEither(t *testing.T, first *peerProcess, firstText string, second *peerProcess, secondText string) bool {
+	t.Helper()
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if first.contains(firstText) {
+			return true
+		}
+		if second.contains(secondText) {
+			return false
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			t.Fatalf("timed out waiting for either %q or %q\nfirst output:\n%s\nsecond output:\n%s", firstText, secondText, first.snapshot(), second.snapshot())
+		}
 	}
 }
 
