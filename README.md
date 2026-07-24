@@ -1,6 +1,6 @@
 # Transferly
 
-Transferly is a foreground terminal application for direct file exchange between reachable Peers. It opens temporary, human-verified Transfer Sessions over a manually supplied IPv4 endpoint and can safely copy explicitly approved regular files in either direction.
+Transferly is a foreground terminal application for direct file exchange between reachable Peers. It discovers Available Peers with mDNS/DNS-SD when multicast works, retains manual IPv4 endpoints as a fallback, opens temporary human-verified Transfer Sessions, and can safely copy explicitly approved regular files in either direction.
 
 Transferly uses no account, cloud service, relay, configuration file, persistent identity, remembered trust, telemetry, or log file.
 
@@ -21,17 +21,27 @@ The resulting executable is portable and does not require a Go runtime on the de
 
 Start `transferly.exe` in a foreground terminal on both computers. Windows Firewall may ask whether to permit inbound connections; allow the executable on the network profile you intend to use.
 
-Each Peer prints one or more endpoints:
+Each idle Peer advertises only its dynamic endpoint and Windows computer name and prints one or more endpoints:
 
 ```text
 Endpoint: 192.168.1.20:53144
 ```
 
-On either Peer, connect to an endpoint printed by the other:
+Available Peers on the local multicast-capable network appear as a numbered list:
 
 ```text
+Available Peers:
+  [1] LAPTOP-NAME at 192.168.1.20:53144 (untrusted discovery label)
+```
+
+Connect by current list number or by a manually supplied endpoint:
+
+```text
+connect 1
 connect 192.168.1.20:53144
 ```
+
+Computer names and discovery records are untrusted availability hints; they never establish identity or remembered trust. Stale advertisements disappear, duplicate names remain distinguishable by endpoint, and a Peer withdraws its advertisement while a connection is pending or active. If mDNS is blocked or unavailable, startup and manual endpoint connection continue normally.
 
 Both terminals display a six-digit code. Compare the codes through an in-person or otherwise trusted channel, then type `yes` on both terminals only when they match. Type `no` on either terminal if they do not match.
 
@@ -58,4 +68,9 @@ go test ./...
 go test -race ./...
 ```
 
-The integration suite builds and launches real Transferly processes over loopback and interacts with their public terminal interface.
+The integration suite builds and launches real Transferly processes over loopback and interacts with their public terminal interface. On a multicast-capable local network, opt into the two-process real mDNS check:
+
+```powershell
+$env:TRANSFERLY_TEST_MDNS = "1"
+go test ./integration -run TestRealMDNSDiscoveryConnectsByAvailablePeerNumber
+```

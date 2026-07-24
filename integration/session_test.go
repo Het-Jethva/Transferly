@@ -754,6 +754,33 @@ func TestAdditionalConnectionsReceiveAClearBusyOutcome(t *testing.T) {
 	additional.waitForCount(t, "Peer is busy with another active or pending Transfer Session", busyBefore+1)
 }
 
+func TestRealMDNSDiscoveryConnectsByAvailablePeerNumber(t *testing.T) {
+	if os.Getenv("TRANSFERLY_TEST_MDNS") != "1" {
+		t.Skip("set TRANSFERLY_TEST_MDNS=1 on a multicast-capable local network")
+	}
+	first := startPeerAt(t, transferlyExecutable, "0.0.0.0:0")
+	second := startPeerAt(t, transferlyExecutable, "0.0.0.0:0")
+
+	listing := first.waitFor(t, " at "+second.endpoint+" (untrusted discovery label)")
+	selectionPattern := regexp.MustCompile(`\[(\d+)\][^\n]* at ` + regexp.QuoteMeta(second.endpoint))
+	match := selectionPattern.FindStringSubmatch(listing)
+	if match == nil {
+		t.Fatalf("could not select discovered endpoint %s from output:\n%s", second.endpoint, listing)
+	}
+
+	first.send(t, "connect "+match[1])
+	first.waitFor(t, "Discovery names do not establish identity or trust")
+	firstCode := first.waitForCode(t, 0)
+	secondCode := second.waitForCode(t, 0)
+	if firstCode != secondCode {
+		t.Fatalf("Peers displayed different verification codes: %s and %s", firstCode, secondCode)
+	}
+	first.send(t, "yes")
+	second.send(t, "yes")
+	first.waitFor(t, "Transfer Session verified")
+	second.waitFor(t, "Transfer Session verified")
+}
+
 func TestConnectionErrorsLeaveThePeerAvailable(t *testing.T) {
 	first := startPeer(t, transferlyExecutable)
 	second := startPeer(t, transferlyExecutable)
@@ -804,7 +831,7 @@ func verifyPeers(t *testing.T, first, second *peerProcess) {
 }
 
 var (
-	endpointPattern         = regexp.MustCompile(`Endpoint: (127\.0\.0\.1:\d+)`)
+	endpointPattern         = regexp.MustCompile(`Endpoint: ((\d{1,3}\.){3}\d{1,3}:\d+)`)
 	verificationCodePattern = regexp.MustCompile(`Verification code: (\d{6})`)
 )
 
@@ -822,9 +849,14 @@ type peerProcess struct {
 
 func startPeer(t *testing.T, executable string) *peerProcess {
 	t.Helper()
+	return startPeerAt(t, executable, "127.0.0.1:0")
+}
+
+func startPeerAt(t *testing.T, executable, listenAddress string) *peerProcess {
+	t.Helper()
 	workDir := t.TempDir()
 	homeDir := t.TempDir()
-	command := exec.Command(executable, "--listen", "127.0.0.1:0")
+	command := exec.Command(executable, "--listen", listenAddress)
 	command.Dir = workDir
 	command.Env = append(os.Environ(), "HOME="+homeDir, "USERPROFILE="+homeDir, "GOMEMLIMIT=24MiB")
 	stdin, err := command.StdinPipe()
@@ -844,7 +876,7 @@ func startPeer(t *testing.T, executable string) *peerProcess {
 	t.Cleanup(func() { peer.stop(t) })
 
 	go peer.collect(stdout)
-	endpointLine := peer.waitFor(t, "Endpoint: 127.0.0.1:")
+	endpointLine := peer.waitFor(t, "Endpoint: ")
 	match := endpointPattern.FindStringSubmatch(endpointLine)
 	if match == nil {
 		t.Fatalf("could not parse endpoint from output:\n%s", peer.snapshot())

@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Het-Jethva/Transferly/internal/discovery"
 	"github.com/Het-Jethva/Transferly/internal/session"
 )
 
@@ -36,7 +37,9 @@ const (
 type Config struct {
 	ListenAddress    string
 	Version          session.Version
-	CorruptDigest    bool // Used only by protocol-boundary integration builds.
+	ComputerName     string
+	Discovery        discovery.Multicast // Replaceable mDNS/DNS-SD boundary.
+	CorruptDigest    bool                // Used only by protocol-boundary integration builds.
 	IdleWarningAfter time.Duration
 	IdleTimeoutAfter time.Duration
 	StreamChunkDelay time.Duration // Nonzero only in process-level idle tests.
@@ -45,10 +48,11 @@ type Config struct {
 
 // App owns one foreground listener and at most one Transfer Session.
 type App struct {
-	config   Config
-	listener net.Listener
-	output   io.Writer
-	clock    sessionClock
+	config    Config
+	listener  net.Listener
+	output    io.Writer
+	clock     sessionClock
+	discovery *discovery.Manager
 
 	rootContext context.Context
 	cancelRoot  context.CancelFunc
@@ -141,6 +145,13 @@ func New(config Config, output io.Writer) (*App, error) {
 	if err := validateListenAddress(config.ListenAddress); err != nil {
 		return nil, err
 	}
+	if config.ComputerName == "" {
+		computerName, err := os.Hostname()
+		if err != nil {
+			return nil, fmt.Errorf("read Windows computer name: %w", err)
+		}
+		config.ComputerName = computerName
+	}
 	listener, err := net.Listen("tcp4", config.ListenAddress)
 	if err != nil {
 		return nil, fmt.Errorf("listen on %s: %w", config.ListenAddress, err)
@@ -150,14 +161,27 @@ func New(config Config, output io.Writer) (*App, error) {
 		clock = newManualSessionClock()
 	}
 	rootContext, cancelRoot := context.WithCancel(context.Background())
-	return &App{
+	application := &App{
 		config:      config,
 		listener:    listener,
 		output:      output,
 		clock:       clock,
 		rootContext: rootContext,
 		cancelRoot:  cancelRoot,
-	}, nil
+	}
+	discoveryAddresses := discoverableIPv4(listener.Addr(), config.Discovery != nil)
+	if len(discoveryAddresses) > 0 {
+		multicast := config.Discovery
+		if multicast == nil {
+			multicast = discovery.NewMDNS()
+		}
+		application.discovery = discovery.NewManager(multicast, discovery.Advertisement{
+			ComputerName: config.ComputerName,
+			Port:         listener.Addr().(*net.TCPAddr).Port,
+			IPv4:         discoveryAddresses,
+		})
+	}
+	return application, nil
 }
 
 // Run serves incoming Peers and handles commands until quit, end-of-input, or
@@ -168,6 +192,14 @@ func (a *App) Run(input io.Reader) error {
 		a.line("Endpoint: %s", endpoint)
 	}
 	a.printCommands()
+	if a.discovery != nil {
+		a.line("Discovery: mDNS/DNS-SD is searching the local IPv4 network. Computer names are untrusted hints.")
+		a.showAvailablePeers()
+		a.discovery.Start(a.rootContext)
+		go a.observeDiscovery()
+	} else {
+		a.line("Discovery unavailable for this listener; manual connect <IPv4:port> remains available.")
+	}
 
 	go a.acceptConnections()
 
@@ -226,10 +258,10 @@ func (a *App) handleLine(line string) bool {
 	switch command {
 	case "connect":
 		if argument == "" || strings.ContainsAny(argument, " \t") {
-			a.line("Usage: connect <IPv4:port>")
+			a.line("Usage: connect <peer-number|IPv4:port>")
 			return false
 		}
-		a.connect(argument)
+		a.connectTarget(argument)
 	case "send":
 		path, ok := onePathArgument(argument)
 		if !ok {
@@ -281,7 +313,56 @@ func onePathArgument(argument string) (string, bool) {
 }
 
 func (a *App) printCommands() {
-	a.line("Commands: connect <IPv4:port>, send <path>, keep-alive, disconnect, quit")
+	a.line("Commands: connect <peer-number|IPv4:port>, send <path>, keep-alive, disconnect, quit")
+}
+
+func (a *App) connectTarget(target string) {
+	if number, err := strconv.Atoi(target); err == nil {
+		peers := []discovery.Peer(nil)
+		if a.discovery != nil {
+			peers = a.discovery.Peers()
+		}
+		if number < 1 || number > len(peers) {
+			a.line("Available Peer %d is not currently listed. Use an IPv4:port endpoint instead.", number)
+			return
+		}
+		peer := peers[number-1]
+		a.line("Connecting to Available Peer %d at %s. Discovery names do not establish identity or trust.", number, peer.Endpoint())
+		a.connect(peer.Endpoint())
+		return
+	}
+	a.connect(target)
+}
+
+func (a *App) observeDiscovery() {
+	for {
+		select {
+		case <-a.discovery.Changes():
+			a.showAvailablePeers()
+		case err := <-a.discovery.Errors():
+			a.line("Discovery warning: %v", err)
+		case <-a.rootContext.Done():
+			return
+		}
+	}
+}
+
+func (a *App) showAvailablePeers() {
+	peers := a.discovery.Peers()
+	if len(peers) == 0 {
+		a.line("No Available Peers discovered; use connect <IPv4:port> if multicast is unavailable.")
+		return
+	}
+	a.line("Available Peers:")
+	for index, peer := range peers {
+		a.line("  [%d] %s at %s (untrusted discovery label)", index+1, peer.ComputerName, peer.Endpoint())
+	}
+}
+
+func (a *App) setDiscoveryAvailable(available bool) {
+	if a.discovery != nil {
+		a.discovery.SetAvailable(available)
+	}
 }
 
 func (a *App) answerPendingConfirmation(line string) bool {
@@ -419,8 +500,8 @@ func (a *App) acceptConnections() {
 
 func (a *App) beginAttempt(remote string) (*attempt, bool) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if a.closed || a.current != nil {
+		a.mu.Unlock()
 		return nil, false
 	}
 	attemptContext, cancel := context.WithCancel(a.rootContext)
@@ -433,6 +514,8 @@ func (a *App) beginAttempt(remote string) (*attempt, bool) {
 		finished: make(chan struct{}),
 	}
 	a.current = current
+	a.mu.Unlock()
+	a.setDiscoveryAvailable(false)
 	return current, true
 }
 
@@ -503,11 +586,15 @@ func (a *App) establish(current *attempt, connection net.Conn, role session.Role
 	a.cleanupIncoming(current)
 	a.mu.Lock()
 	wasCurrent := a.current == current
+	becameAvailable := wasCurrent && !a.closed
 	if wasCurrent {
 		a.current = nil
 	}
 	a.mu.Unlock()
 	_ = secured.Close()
+	if becameAvailable {
+		a.setDiscoveryAvailable(true)
+	}
 	if wasCurrent {
 		if waitError != nil {
 			a.line("Transfer Session ended after a connection error: %v", waitError)
@@ -1259,12 +1346,16 @@ func (a *App) reportSessionError(remote string, err error) {
 
 func (a *App) finishFailed(current *attempt) {
 	a.mu.Lock()
+	becameAvailable := a.current == current && !a.closed
 	if a.current == current {
 		a.current = nil
 	}
 	current.waiting = false
 	a.mu.Unlock()
 	current.cancel()
+	if becameAvailable {
+		a.setDiscoveryAvailable(true)
+	}
 }
 
 func (a *App) disconnect() {
@@ -1366,6 +1457,49 @@ func validateListenAddress(address string) error {
 	return nil
 }
 
+func discoverableIPv4(address net.Addr, includeLoopback bool) []net.IP {
+	tcpAddress, ok := address.(*net.TCPAddr)
+	if !ok {
+		return nil
+	}
+	if !tcpAddress.IP.IsUnspecified() {
+		ipv4 := tcpAddress.IP.To4()
+		if ipv4 != nil && (!ipv4.IsLoopback() || includeLoopback) {
+			return []net.IP{append(net.IP(nil), ipv4...)}
+		}
+		return nil
+	}
+
+	seen := make(map[string]struct{})
+	var addresses []net.IP
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	for _, networkInterface := range interfaces {
+		if networkInterface.Flags&net.FlagUp == 0 || networkInterface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		interfaceAddresses, addressError := networkInterface.Addrs()
+		if addressError != nil {
+			continue
+		}
+		for _, candidate := range interfaceAddresses {
+			ip, _, parseError := net.ParseCIDR(candidate.String())
+			ipv4 := ip.To4()
+			if parseError != nil || ipv4 == nil || ipv4.IsUnspecified() || ipv4.IsLoopback() {
+				continue
+			}
+			if _, exists := seen[ipv4.String()]; !exists {
+				seen[ipv4.String()] = struct{}{}
+				addresses = append(addresses, append(net.IP(nil), ipv4...))
+			}
+		}
+	}
+	sort.Slice(addresses, func(first, second int) bool { return addresses[first].String() < addresses[second].String() })
+	return addresses
+}
+
 func advertisedEndpoints(address net.Addr) []string {
 	tcpAddress, ok := address.(*net.TCPAddr)
 	if !ok {
@@ -1375,30 +1509,10 @@ func advertisedEndpoints(address net.Addr) []string {
 		return []string{net.JoinHostPort(tcpAddress.IP.String(), strconv.Itoa(tcpAddress.Port))}
 	}
 
-	seen := make(map[string]struct{})
-	var endpoints []string
-	interfaces, err := net.Interfaces()
-	if err == nil {
-		for _, networkInterface := range interfaces {
-			if networkInterface.Flags&net.FlagUp == 0 || networkInterface.Flags&net.FlagLoopback != 0 {
-				continue
-			}
-			addresses, addressError := networkInterface.Addrs()
-			if addressError != nil {
-				continue
-			}
-			for _, candidate := range addresses {
-				ip, _, parseError := net.ParseCIDR(candidate.String())
-				if parseError != nil || ip.To4() == nil || ip.IsUnspecified() || ip.IsLoopback() {
-					continue
-				}
-				endpoint := net.JoinHostPort(ip.String(), strconv.Itoa(tcpAddress.Port))
-				if _, exists := seen[endpoint]; !exists {
-					seen[endpoint] = struct{}{}
-					endpoints = append(endpoints, endpoint)
-				}
-			}
-		}
+	addresses := discoverableIPv4(address, false)
+	endpoints := make([]string, 0, len(addresses))
+	for _, ip := range addresses {
+		endpoints = append(endpoints, net.JoinHostPort(ip.String(), strconv.Itoa(tcpAddress.Port)))
 	}
 	if len(endpoints) == 0 {
 		endpoints = append(endpoints, net.JoinHostPort("127.0.0.1", strconv.Itoa(tcpAddress.Port)))
