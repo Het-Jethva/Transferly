@@ -125,13 +125,15 @@ golangci-lint run ./...
 
 The integration suite builds and launches real Transferly processes over loopback and interacts with their public terminal interface. CI also runs the targeted verification-code, conflict-name, and manifest-limit fuzz smoke tests, the race detector, benchmarks, and reproducible portable-package checks. Complete commands and expected evidence are in [the release validation runbook](docs/release-validation.md).
 
-Because the suite drives separate executables, an ordinary `-coverprofile` run reports no statements for it. Build the Peers with coverage instrumentation instead and merge the per-process profiles:
+Because the suite drives separate executables, an ordinary `-coverprofile` run reports no statements for it and makes the project look far less tested than it is. Build the Peers with coverage instrumentation instead and merge the per-process profiles:
 
 ```powershell
 $env:TRANSFERLY_COVERDIR = "$PWD/covdata"
 go test ./... -coverpkg=./internal/...,./cmd/...
 go tool covdata percent -i=covdata
 ```
+
+Measured that way, the behavior driven through the public terminal interface covers 77% of `internal/terminal`, 73% of `internal/session`, and 41% of `cmd/transferly`. `internal/discovery` is exercised by its own unit tests and by the opt-in mDNS check below, since multicast discovery does not run on a loopback-only machine.
 
 Behavior that cannot be reached through the public terminal interface -- a corrupted digest on the wire, a deliberately slowed stream, a controllable session clock -- lives behind the `transferly_faults` build tag and is compiled out of every release artifact. `scripts/build-release.ps1` fails the build if fault code is present in the published executable. Run the injectable variant with:
 
