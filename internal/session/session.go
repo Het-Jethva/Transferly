@@ -187,33 +187,33 @@ func protectAndNegotiate(ctx context.Context, raw net.Conn, role Role, version V
 		configuration.ClientAuth = tls.RequireAnyClientCert
 		protected = tls.Server(raw, configuration)
 	}
-	fail := func(err error) (*tls.Conn, *bufio.Reader, tls.ConnectionState, error) {
+	fail := func(err error) error {
 		_ = protected.Close()
-		return nil, nil, tls.ConnectionState{}, err
+		return err
 	}
 
 	handshakeContext, cancelHandshake := context.WithTimeout(ctx, handshakeTimeout)
 	defer cancelHandshake()
 	if err := protected.HandshakeContext(handshakeContext); err != nil {
-		return fail(fmt.Errorf("TLS 1.3 handshake: %w", err))
+		return nil, nil, tls.ConnectionState{}, fail(fmt.Errorf("TLS 1.3 handshake: %w", err))
 	}
 	state := protected.ConnectionState()
 	if state.Version != tls.VersionTLS13 || len(state.PeerCertificates) == 0 {
-		return fail(errors.New("Peer did not establish mutually authenticated TLS 1.3"))
+		return nil, nil, tls.ConnectionState{}, fail(errors.New("Peer did not establish mutually authenticated TLS 1.3"))
 	}
 	reader := bufio.NewReaderSize(protected, maximumFrameBytes)
 	if err := writeFrame(protected, wireMessage{Type: "hello", Version: version}); err != nil {
-		return fail(fmt.Errorf("send protocol version: %w", err))
+		return nil, nil, tls.ConnectionState{}, fail(fmt.Errorf("send protocol version: %w", err))
 	}
 	peerHello, err := readWireFrame(reader)
 	if err != nil {
-		return fail(fmt.Errorf("read protocol version: %w", err))
+		return nil, nil, tls.ConnectionState{}, fail(fmt.Errorf("read protocol version: %w", err))
 	}
 	if peerHello.Type != "hello" {
-		return fail(fmt.Errorf("expected protocol hello, received %q", peerHello.Type))
+		return nil, nil, tls.ConnectionState{}, fail(fmt.Errorf("expected protocol hello, received %q", peerHello.Type))
 	}
 	if peerHello.Version.Major != version.Major {
-		return fail(&VersionError{Local: version, Peer: peerHello.Version})
+		return nil, nil, tls.ConnectionState{}, fail(&VersionError{Local: version, Peer: peerHello.Version})
 	}
 	return protected, reader, state, nil
 }
@@ -322,10 +322,6 @@ func (s *Session) ReceiveStream(ctx context.Context, destination io.Writer, size
 		return "", err
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
-}
-
-func copyStream(ctx context.Context, destination io.Writer, source io.Reader, size int64, progress Progress) error {
-	return copyStreamBuffer(ctx, destination, source, size, progress, make([]byte, streamBufferBytes))
 }
 
 func copyStreamBuffer(ctx context.Context, destination io.Writer, source io.Reader, size int64, progress Progress, buffer []byte) error {

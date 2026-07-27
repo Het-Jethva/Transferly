@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"strconv"
-	"time"
 
 	"github.com/Het-Jethva/Transferly/internal/session"
 	"github.com/Het-Jethva/Transferly/internal/terminal"
@@ -14,12 +13,9 @@ import (
 // wireMajor is a string so release builds can set it with -ldflags -X while
 // keeping wire-protocol versioning independent from the executable version.
 var (
-	buildVersion     = "dev" // Set for releases with -ldflags "-X main.buildVersion=vX.Y.Z".
-	wireMajor        = "3"
-	wireMinor        = "0"
-	corruptDigest    = "false" // Overridden only by protocol-boundary integration builds.
-	streamChunkDelay = "0s"    // Overridden only by process-level idle tests.
-	controllableTime = "false" // Overridden only by process-level idle tests.
+	buildVersion = "dev" // Set for releases with -ldflags "-X main.buildVersion=vX.Y.Z".
+	wireMajor    = "3"
+	wireMinor    = "0"
 )
 
 func main() {
@@ -64,15 +60,9 @@ func main() {
 		fmt.Printf("Transferly %s\nWire protocol %d.%d\n", buildVersion, major, minor)
 		return
 	}
-	corrupt, err := strconv.ParseBool(corruptDigest)
+	faults, err := faultSettings()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "Transferly was built with an invalid integration fault setting.")
-		os.Exit(1)
-	}
-	chunkDelay, chunkDelayError := time.ParseDuration(streamChunkDelay)
-	manualTime, manualTimeError := strconv.ParseBool(controllableTime)
-	if chunkDelayError != nil || manualTimeError != nil || chunkDelay < 0 {
-		fmt.Fprintln(os.Stderr, "Transferly was built with invalid process-test settings.")
+		fmt.Fprintln(os.Stderr, "Transferly was built with invalid fault-injection settings.")
 		os.Exit(1)
 	}
 	application, err := terminal.New(terminal.Config{
@@ -81,9 +71,7 @@ func main() {
 		ProductVersion:     buildVersion,
 		ComputerName:       *computerName,
 		DefaultDestination: *defaultOutput,
-		CorruptDigest:      corrupt,
-		StreamChunkDelay:   chunkDelay,
-		ControllableTime:   manualTime,
+		Faults:             faults,
 	}, os.Stdout)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Could not start Transferly: %v\n", err)

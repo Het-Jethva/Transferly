@@ -51,11 +51,9 @@ type Config struct {
 	DefaultDestination string
 	Discovery          discovery.Multicast                             // Replaceable mDNS/DNS-SD boundary.
 	PeerDial           func(context.Context, string) (net.Conn, error) // Explicit Peer connection boundary.
-	CorruptDigest      bool                                            // Used only by protocol-boundary integration builds.
 	IdleWarningAfter   time.Duration
 	IdleTimeoutAfter   time.Duration
-	StreamChunkDelay   time.Duration // Nonzero only in process-level idle tests.
-	ControllableTime   bool          // Enabled only in process-level idle tests.
+	Faults             FaultConfig // Empty and inert unless built with -tags transferly_faults.
 }
 
 // App owns one foreground listener and at most one Transfer Session.
@@ -167,8 +165,8 @@ func New(config Config, output io.Writer) (*App, error) {
 	if config.IdleWarningAfter <= 0 || config.IdleTimeoutAfter <= config.IdleWarningAfter {
 		return nil, errors.New("idle timeout must be greater than the positive idle warning duration")
 	}
-	if config.StreamChunkDelay < 0 {
-		return nil, errors.New("stream chunk delay cannot be negative")
+	if err := config.Faults.validate(); err != nil {
+		return nil, err
 	}
 	if config.PeerDial == nil {
 		config.PeerDial = func(ctx context.Context, endpoint string) (net.Conn, error) {
@@ -209,10 +207,7 @@ func New(config Config, output io.Writer) (*App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen on %s: %w. Check that the address is available and allow Transferly through Windows Firewall for the intended network profile; Transferly never requests elevation or changes firewall policy", config.ListenAddress, err)
 	}
-	clock := sessionClock(realSessionClock{})
-	if config.ControllableTime {
-		clock = newManualSessionClock()
-	}
+	clock := newSessionClock(config.Faults)
 	rootContext, cancelRoot := context.WithCancel(context.Background())
 	application := &App{
 		config:      config,
@@ -739,7 +734,7 @@ func (a *App) serveSession(current *attempt) error {
 				return err
 			}
 		case messageActivity:
-			if a.config.ControllableTime {
+			if a.timeControlEnabled() {
 				a.line("Test clock: Peer terminal activity observed.")
 			}
 		case messageKeepAlive:
@@ -1092,10 +1087,7 @@ func (a *App) sendManifestFile(current *attempt, outgoing *outgoingOffer, entry 
 			chunkBytes = remaining
 		}
 		if chunkBytes > 0 {
-			var sourceReader io.Reader = source
-			if a.config.StreamChunkDelay > 0 {
-				sourceReader = &delayedReader{context: current.context, source: source, delay: a.config.StreamChunkDelay}
-			}
+			sourceReader := a.faultStreamReader(current.context, source)
 			if _, err := io.ReadFull(sourceReader, buffer[:chunkBytes]); err != nil {
 				return errors.New("source changed or could not be read completely")
 			}
@@ -1129,9 +1121,7 @@ func (a *App) sendManifestFile(current *attempt, outgoing *outgoingOffer, entry 
 		completion.Success = &failed
 		completion.Reason = "source changed after approval"
 	}
-	if a.config.CorruptDigest {
-		completion.Digest = corruptSHA256(digest)
-	}
+	completion.Digest = a.faultDigest(completion.Digest)
 	return current.secure.SendChecked(completion, func() error {
 		a.mu.Lock()
 		defer a.mu.Unlock()
@@ -1140,23 +1130,6 @@ func (a *App) sendManifestFile(current *attempt, outgoing *outgoingOffer, entry 
 		}
 		return nil
 	})
-}
-
-type delayedReader struct {
-	context context.Context
-	source  io.Reader
-	delay   time.Duration
-}
-
-func (r *delayedReader) Read(destination []byte) (int, error) {
-	timer := time.NewTimer(r.delay)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-		return r.source.Read(destination)
-	case <-r.context.Done():
-		return 0, r.context.Err()
-	}
 }
 
 func (a *App) failOutgoing(current *attempt, outgoing *outgoingOffer, format string, arguments ...any) {
@@ -1300,15 +1273,16 @@ func validateReceivedManifest(incoming *incomingOffer) error {
 			return fmt.Errorf("Peer sent manifest paths with a case-insensitive or Unicode alias: %q", entry.Path)
 		}
 		seen[key] = entry
-		if entry.Kind == manifestFile {
+		switch entry.Kind {
+		case manifestFile:
 			files++
 			if entry.Size > incoming.manifest.TotalBytes-bytes {
 				return errors.New("Peer sent a Transfer Offer whose byte total overflows or is inconsistent")
 			}
 			bytes += entry.Size
-		} else if entry.Kind == manifestFolder {
+		case manifestFolder:
 			folders++
-		} else {
+		default:
 			return errors.New("Peer sent an unsupported manifest entry kind")
 		}
 		if !strings.Contains(entry.Path, "/") {
@@ -1736,11 +1710,18 @@ func (a *App) completeIncomingFile(current *attempt, completion session.Message)
 	return nil
 }
 
+// recoverableWriter records the first destination failure but keeps reporting
+// success to its caller so the stream is still drained completely. Returning
+// the error here would desynchronize the wire, stranding the remaining bytes of
+// this file in front of the next frame and failing the whole Transfer Offer.
+// The recorded failure is surfaced afterwards, which is what lets independently
+// verified files stay published when one file fails.
 type recoverableWriter struct {
 	destination io.Writer
 	failure     error
 }
 
+//nolint:nilerr // Failures are recorded and reported after the stream drains.
 func (w *recoverableWriter) Write(content []byte) (int, error) {
 	if w.failure != nil {
 		return len(content), nil
@@ -2157,16 +2138,6 @@ func newOfferID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(identifier), nil
-}
-
-func corruptSHA256(digest string) string {
-	if digest == "" {
-		return digest
-	}
-	if digest[0] == '0' {
-		return "1" + digest[1:]
-	}
-	return "0" + digest[1:]
 }
 
 func (a *App) progress(label string, total int64) session.Progress {

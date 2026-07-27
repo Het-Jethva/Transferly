@@ -22,7 +22,9 @@ func availableDiskBytes(path string) (uint64, bool, error) {
 		0,
 	)
 	if result == 0 {
-		if callError == syscall.Errno(0) {
+		// Call always yields a raw syscall.Errno, never a wrapped error, so a
+		// direct comparison is the correct zero check here.
+		if callError == syscall.Errno(0) { //nolint:errorlint // raw syscall return
 			callError = syscall.EINVAL
 		}
 		return 0, false, callError

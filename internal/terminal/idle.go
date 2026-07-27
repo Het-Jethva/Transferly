@@ -6,27 +6,6 @@ import (
 	"github.com/Het-Jethva/Transferly/internal/session"
 )
 
-func (a *App) advanceControllableTime(line string) bool {
-	if !a.config.ControllableTime {
-		return false
-	}
-	command, argument := splitCommand(line)
-	if command != "advance-time" {
-		return false
-	}
-	duration, err := time.ParseDuration(argument)
-	if err != nil || duration <= 0 {
-		a.line("Usage: advance-time <positive-duration>")
-		return true
-	}
-	manual, ok := a.clock.(*manualSessionClock)
-	if !ok {
-		return false
-	}
-	manual.Advance(duration)
-	return true
-}
-
 func (a *App) keepAlive() {
 	a.mu.Lock()
 	current := a.current

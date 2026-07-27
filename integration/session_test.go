@@ -28,7 +28,15 @@ var (
 	corruptDigestExecutable          string
 	shortIdleExecutable              string
 	slowIdleExecutable               string
+	coverageDirectory                string
 )
+
+// coverageEnabled reports whether this run should collect coverage from the
+// Transferly processes the suite launches. Because the suite exercises the
+// product through real executables, ordinary -coverprofile accounting sees
+// nothing; the binaries are instead built with -cover and each process writes
+// its own profile into GOCOVERDIR for later merging with `go tool covdata`.
+func coverageEnabled() bool { return coverageDirectory != "" }
 
 func TestMain(m *testing.M) {
 	_, currentFile, _, ok := runtime.Caller(0)
@@ -37,6 +45,19 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	projectRoot = filepath.Dir(filepath.Dir(currentFile))
+
+	if requested := os.Getenv("TRANSFERLY_COVERDIR"); requested != "" {
+		absolute, err := filepath.Abs(requested)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if err := os.MkdirAll(absolute, 0o755); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		coverageDirectory = absolute
+	}
 
 	tempDir, err := os.MkdirTemp("", "transferly-integration-")
 	if err != nil {
@@ -62,15 +83,15 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	if err := buildExecutable(corruptDigestExecutable, "-ldflags", "-X main.corruptDigest=true"); err != nil {
+	if err := buildFaultExecutable(corruptDigestExecutable, "-ldflags", "-X main.corruptDigest=true"); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	if err := buildExecutable(shortIdleExecutable, "-ldflags", "-X main.controllableTime=true"); err != nil {
+	if err := buildFaultExecutable(shortIdleExecutable, "-ldflags", "-X main.controllableTime=true"); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	if err := buildExecutable(slowIdleExecutable, "-ldflags", "-X main.controllableTime=true -X main.streamChunkDelay=40ms"); err != nil {
+	if err := buildFaultExecutable(slowIdleExecutable, "-ldflags", "-X main.controllableTime=true -X main.streamChunkDelay=40ms"); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -85,10 +106,21 @@ func TestMain(m *testing.M) {
 	os.Exit(exitCode)
 }
 
+// buildFaultExecutable builds the injectable variant. Fault behavior lives
+// behind the transferly_faults build tag so the default executable under test
+// -- and every released artifact -- contains no fault branch at all.
+func buildFaultExecutable(destination string, extraArguments ...string) error {
+	arguments := append([]string{"-tags", "transferly_faults"}, extraArguments...)
+	return buildExecutable(destination, arguments...)
+}
+
 func buildExecutable(destination string, extraArguments ...string) error {
 	arguments := []string{"build", "-o", destination}
 	if raceEnabled {
 		arguments = append(arguments, "-race")
+	}
+	if coverageEnabled() {
+		arguments = append(arguments, "-cover", "-coverpkg=github.com/Het-Jethva/Transferly/...")
 	}
 	arguments = append(arguments, extraArguments...)
 	arguments = append(arguments, "./cmd/transferly")
@@ -1495,6 +1527,11 @@ func startPeerWithArguments(t *testing.T, executable, homeDir string, arguments 
 	command := exec.Command(executable, arguments...)
 	command.Dir = workDir
 	command.Env = append(os.Environ(), "HOME="+homeDir, "USERPROFILE="+homeDir, "GOMEMLIMIT=24MiB")
+	if coverageEnabled() {
+		// Each Peer process writes its own profile fragment; the fragments are
+		// merged after the suite finishes.
+		command.Env = append(command.Env, "GOCOVERDIR="+coverageDirectory)
+	}
 	stdin, err := command.StdinPipe()
 	if err != nil {
 		t.Fatal(err)

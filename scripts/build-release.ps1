@@ -52,6 +52,22 @@ try {
         throw "release build is not reproducible: $firstHash differs from $secondHash"
     }
 
+    # Fault injection is compiled out by the absence of the transferly_faults
+    # build tag. Assert it rather than trusting the build line: the marker below
+    # is reachable only from the injectable variant.
+    $bytes = [System.IO.File]::ReadAllBytes($first)
+    $marker = [System.Text.Encoding]::ASCII.GetBytes('advance-time')
+    $limit = $bytes.Length - $marker.Length
+    for ($i = 0; $i -le $limit; $i++) {
+        $matched = $true
+        for ($j = 0; $j -lt $marker.Length; $j++) {
+            if ($bytes[$i + $j] -ne $marker[$j]) { $matched = $false; break }
+        }
+        if ($matched) {
+            throw 'release build contains fault-injection code; refusing to publish an injectable artifact'
+        }
+    }
+
     Move-Item -Force $first $artifact
     Remove-Item -Force $second
     "$($firstHash.ToLowerInvariant())  transferly-windows-amd64.exe" |
