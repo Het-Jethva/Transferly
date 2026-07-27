@@ -34,7 +34,15 @@ $env:GOARCH = "amd64"
 go build -trimpath -ldflags "-s -w -X main.buildVersion=v1.0.0" -o transferly.exe ./cmd/transferly
 ```
 
-The resulting single executable is portable: it needs no installer, separate Go runtime, background service, system-tray process, or administrator privileges. Release artifacts must be Authenticode-signed with the project's protected signing credentials. `scripts/build-release.ps1` performs a reproducibility check, and `scripts/verify-portable.ps1` checks the Windows x64 artifact in an isolated directory. The protected release workflow refuses to publish a missing or invalid signature. See [the release validation runbook](docs/release-validation.md) for signing, automated gates, and the physical two-laptop matrix. Check the executable and independently versioned wire protocol with `transferly.exe --version`. Updates are manual: replace the executable with a newer signed build. Transferly performs no update checks.
+The resulting single executable is portable: it needs no installer, separate Go runtime, background service, system-tray process, or administrator privileges. `scripts/build-release.ps1` builds twice and fails if the two artifacts do not hash identically, and `scripts/verify-portable.ps1` checks the Windows x64 artifact in an isolated directory.
+
+Published releases are currently **unsigned**, because the project has no code-signing certificate; SmartScreen will warn on first run. Every release ships a SHA-256 checksum, so verify the download before running it:
+
+```powershell
+Get-FileHash -Algorithm SHA256 transferly-windows-amd64.exe
+```
+
+The release workflow signs automatically and refuses to publish an invalid signature once `WINDOWS_SIGNING_CERTIFICATE_BASE64` and `WINDOWS_SIGNING_CERTIFICATE_PASSWORD` are configured. See [the release validation runbook](docs/release-validation.md) for signing, automated gates, and the physical two-laptop matrix. Check the executable and independently versioned wire protocol with `transferly.exe --version`. Updates are manual: replace the executable with a newer signed build. Transferly performs no update checks.
 
 ## Use
 
