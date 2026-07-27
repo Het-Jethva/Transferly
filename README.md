@@ -1,8 +1,22 @@
 # Transferly
 
+[![test](https://github.com/Het-Jethva/Transferly/actions/workflows/test.yml/badge.svg)](https://github.com/Het-Jethva/Transferly/actions/workflows/test.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/Het-Jethva/Transferly)](https://goreportcard.com/report/github.com/Het-Jethva/Transferly)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Transferly is a foreground terminal application for direct file exchange between reachable Peers. It discovers Available Peers with mDNS/DNS-SD when multicast works, retains manual IPv4 endpoints as a fallback, opens temporary human-verified Transfer Sessions, and can safely copy explicitly approved regular files in either direction.
 
 Transferly uses no account, cloud service, relay, configuration file, persistent identity, remembered trust, telemetry, or log file.
+
+![Two Transferly Peers verifying a session and transferring a folder](docs/demo.svg)
+
+## How it works
+
+Two Peers connect directly over TCP and immediately establish mutually authenticated TLS 1.3 using ed25519 credentials that are generated per connection and never written to disk. Because neither Peer has a certificate authority or any remembered identity, the handshake alone cannot prove who is on the other end.
+
+Transferly closes that gap with a short authentication string. Both Peers derive a six-digit code from the TLS exporter (RFC 5705) over the finished handshake, so the code is a function of the session keys. A network attacker who intercepts the connection necessarily terminates two different TLS sessions and cannot make both codes agree; the humans comparing those codes out of band are what turn an encrypted channel into an authenticated one. Trust lasts exactly as long as the connection.
+
+Content is protected separately from the channel. Every file in a Transfer Offer is listed in a manifest with its size and SHA-256 digest, the receiving Peer approves that manifest as a whole, and each file is then streamed into destination-local staging, verified against the approved digest, and only published by an atomic rename that never overwrites existing content. A file whose source changed after approval fails on its own without disturbing the files that already verified.
 
 ## Requirements
 
@@ -20,7 +34,15 @@ $env:GOARCH = "amd64"
 go build -trimpath -ldflags "-s -w -X main.buildVersion=v1.0.0" -o transferly.exe ./cmd/transferly
 ```
 
-The resulting single executable is portable: it needs no installer, separate Go runtime, background service, system-tray process, or administrator privileges. Release artifacts must be Authenticode-signed with the project's protected signing credentials. `scripts/build-release.ps1` performs a reproducibility check, and `scripts/verify-portable.ps1` checks the Windows x64 artifact in an isolated directory. The protected release workflow refuses to publish a missing or invalid signature. See [the release validation runbook](docs/release-validation.md) for signing, automated gates, and the physical two-laptop matrix. Check the executable and independently versioned wire protocol with `transferly.exe --version`. Updates are manual: replace the executable with a newer signed build. Transferly performs no update checks.
+The resulting single executable is portable: it needs no installer, separate Go runtime, background service, system-tray process, or administrator privileges. `scripts/build-release.ps1` builds twice and fails if the two artifacts do not hash identically, and `scripts/verify-portable.ps1` checks the Windows x64 artifact in an isolated directory.
+
+Published releases are currently **unsigned**, because the project has no code-signing certificate; SmartScreen will warn on first run. Every release ships a SHA-256 checksum, so verify the download before running it:
+
+```powershell
+Get-FileHash -Algorithm SHA256 transferly-windows-amd64.exe
+```
+
+The release workflow signs automatically and refuses to publish an invalid signature once `WINDOWS_SIGNING_CERTIFICATE_BASE64` and `WINDOWS_SIGNING_CERTIFICATE_PASSWORD` are configured. See [the release validation runbook](docs/release-validation.md) for signing, automated gates, and the physical two-laptop matrix. Check the executable and independently versioned wire protocol with `transferly.exe --version`. Updates are manual: replace the executable with a newer signed build. Transferly performs no update checks.
 
 ## Use
 
@@ -98,9 +120,28 @@ go test -race ./...
 go test ./internal/session -run=^$ -fuzz=^FuzzProtocolFrameLengthHandling$ -fuzztime=30s
 go test ./internal/terminal -run=^$ -fuzz=^FuzzManifestPathConfinement$ -fuzztime=30s
 go test ./internal/session -run=^$ -bench=^BenchmarkThroughput$ -benchtime=3x -benchmem
+golangci-lint run ./...
 ```
 
-The integration suite builds and launches real Transferly processes over loopback and interacts with their public terminal interface. CI also runs the targeted verification-code, conflict-name, and manifest-limit fuzz smoke tests, the race detector, benchmarks, and reproducible portable-package checks. Complete commands and expected evidence are in [the release validation runbook](docs/release-validation.md). On a multicast-capable local network, opt into the two-process real mDNS check:
+The integration suite builds and launches real Transferly processes over loopback and interacts with their public terminal interface. CI also runs the targeted verification-code, conflict-name, and manifest-limit fuzz smoke tests, the race detector, benchmarks, and reproducible portable-package checks. Complete commands and expected evidence are in [the release validation runbook](docs/release-validation.md).
+
+Because the suite drives separate executables, an ordinary `-coverprofile` run reports no statements for it and makes the project look far less tested than it is. Build the Peers with coverage instrumentation instead and merge the per-process profiles:
+
+```powershell
+$env:TRANSFERLY_COVERDIR = "$PWD/covdata"
+go test ./... -coverpkg=./internal/...,./cmd/...
+go tool covdata percent -i=covdata
+```
+
+Measured that way, the behavior driven through the public terminal interface covers 77% of `internal/terminal`, 73% of `internal/session`, and 41% of `cmd/transferly`. `internal/discovery` is exercised by its own unit tests and by the opt-in mDNS check below, since multicast discovery does not run on a loopback-only machine.
+
+Behavior that cannot be reached through the public terminal interface -- a corrupted digest on the wire, a deliberately slowed stream, a controllable session clock -- lives behind the `transferly_faults` build tag and is compiled out of every release artifact. `scripts/build-release.ps1` fails the build if fault code is present in the published executable. Run the injectable variant with:
+
+```powershell
+go build -tags transferly_faults ./...
+```
+
+On a multicast-capable local network, opt into the two-process real mDNS check:
 
 ```powershell
 $env:TRANSFERLY_TEST_MDNS = "1"

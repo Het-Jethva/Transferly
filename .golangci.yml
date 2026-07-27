@@ -1,0 +1,46 @@
+version: "2"
+
+linters:
+  enable:
+    - bodyclose
+    - copyloopvar
+    - errorlint
+    - gocritic
+    - misspell
+    - nilerr
+    - revive
+    - unconvert
+    - unparam
+
+  settings:
+    revive:
+      rules:
+        - name: exported
+          disabled: true
+    gocritic:
+      disabled-checks:
+        - ifElseChain
+    staticcheck:
+      checks:
+        - all
+        # Peer, Transfer Session, and Transfer Offer are proper domain terms
+        # defined in CONTEXT.md and are capitalized everywhere, including in
+        # error strings that reach the terminal.
+        - -ST1005
+
+  exclusions:
+    presets:
+      - std-error-handling
+    rules:
+      - path: _test\.go$
+        linters:
+          - unparam
+      # Trailing dots and spaces in test map keys are the fixture, not a typo.
+      - path: _test\.go$
+        text: suspicious whitespace
+        linters:
+          - gocritic
+
+formatters:
+  enable:
+    - gofmt

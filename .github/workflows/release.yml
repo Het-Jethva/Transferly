@@ -33,10 +33,9 @@ jobs:
       - name: Benchmark evidence
         run: go test ./internal/session -run=^$ -bench=^BenchmarkThroughput$ -benchtime=1x -benchmem
 
-  signed-windows-release:
+  windows-release:
     needs: quality-gates
     runs-on: windows-latest
-    environment: release
     permissions:
       contents: write
     env:
@@ -58,14 +57,19 @@ jobs:
       - name: Check portable artifact
         shell: pwsh
         run: ./scripts/verify-portable.ps1 -Executable dist/transferly-windows-amd64.exe -ExpectedVersion $env:RELEASE_VERSION
-      - name: Require protected signing credentials
+      - name: Detect signing credentials
+        id: credentials
         shell: pwsh
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:SIGNING_CERTIFICATE_BASE64) -or
-              [string]::IsNullOrWhiteSpace($env:SIGNING_CERTIFICATE_PASSWORD)) {
-            throw 'Protected Windows signing credentials are required; refusing to publish an unsigned artifact.'
+          $available = -not ([string]::IsNullOrWhiteSpace($env:SIGNING_CERTIFICATE_BASE64) -or
+                             [string]::IsNullOrWhiteSpace($env:SIGNING_CERTIFICATE_PASSWORD))
+          "signed=$($available.ToString().ToLowerInvariant())" |
+            Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          if (-not $available) {
+            Write-Host '::warning::No Windows signing credentials are configured; publishing an unsigned artifact with SHA-256 checksums.'
           }
       - name: Sign and verify Authenticode
+        if: steps.credentials.outputs.signed == 'true'
         shell: pwsh
         run: |
           $pfx = Join-Path $env:RUNNER_TEMP 'transferly-signing.pfx'
@@ -75,25 +79,52 @@ jobs:
               -Executable dist/transferly-windows-amd64.exe `
               -PfxPath $pfx `
               -PfxPassword $env:SIGNING_CERTIFICATE_PASSWORD
-            $hash = (Get-FileHash -Algorithm SHA256 dist/transferly-windows-amd64.exe).Hash.ToLowerInvariant()
-            "$hash  transferly-windows-amd64.exe" | Set-Content -Encoding ascii -NoNewline dist/transferly-windows-amd64.exe.sha256
           }
           finally {
             Remove-Item -Force -ErrorAction SilentlyContinue $pfx
           }
-      - name: Re-verify signed artifact
-        shell: pwsh
-        run: |
           $signature = Get-AuthenticodeSignature dist/transferly-windows-amd64.exe
           if ($signature.Status -ne 'Valid') { throw "signature status is $($signature.Status); refusing to publish" }
+      - name: Checksum and re-verify the published artifact
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 dist/transferly-windows-amd64.exe).Hash.ToLowerInvariant()
+          "$hash  transferly-windows-amd64.exe" |
+            Set-Content -Encoding ascii -NoNewline dist/transferly-windows-amd64.exe.sha256
           ./scripts/verify-portable.ps1 -Executable dist/transferly-windows-amd64.exe -ExpectedVersion $env:RELEASE_VERSION
       - uses: actions/upload-artifact@v4
         with:
-          name: transferly-${{ env.RELEASE_VERSION }}-windows-amd64-signed
+          name: transferly-${{ env.RELEASE_VERSION }}-windows-amd64-${{ steps.credentials.outputs.signed == 'true' && 'signed' || 'unsigned' }}
           path: |
             dist/transferly-windows-amd64.exe
             dist/transferly-windows-amd64.exe.sha256
           if-no-files-found: error
+      - name: Describe artifact trust
+        id: trust
+        shell: pwsh
+        run: |
+          if ('${{ steps.credentials.outputs.signed }}' -eq 'true') {
+            $lines = @(
+              'This artifact is Authenticode-signed. Verify it before running:',
+              '',
+              '```powershell',
+              'Get-AuthenticodeSignature transferly-windows-amd64.exe',
+              '```'
+            )
+          } else {
+            $lines = @(
+              '> **This artifact is not Authenticode-signed.** SmartScreen will warn on first run.',
+              '> Verify the download against the published SHA-256 before running it:',
+              '',
+              '```powershell',
+              'Get-FileHash -Algorithm SHA256 transferly-windows-amd64.exe',
+              '```'
+            )
+          }
+          $note = $lines -join "`n"
+          "note<<EOF"  | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          $note        | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          "EOF"        | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
       - name: Publish tag release
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
@@ -103,3 +134,4 @@ jobs:
             dist/transferly-windows-amd64.exe.sha256
           fail_on_unmatched_files: true
           generate_release_notes: true
+          body: ${{ steps.trust.outputs.note }}

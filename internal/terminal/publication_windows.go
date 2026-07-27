@@ -31,7 +31,9 @@ func publishWithoutOverwrite(stagingPath, finalPath string) error {
 		uintptr(moveFileWriteThrough),
 	)
 	if result == 0 {
-		if callError == syscall.Errno(0) {
+		// Call always yields a raw syscall.Errno, never a wrapped error, so a
+		// direct comparison is the correct zero check here.
+		if callError == syscall.Errno(0) { //nolint:errorlint // raw syscall return
 			callError = syscall.EINVAL
 		}
 		return &os.LinkError{Op: "publish", Old: stagingPath, New: finalPath, Err: callError}

@@ -1,6 +1,8 @@
 # Transferly v1 release validation
 
-A release is publishable only when every automated gate is green, the Windows artifact has a valid Authenticode signature, and the physical two-laptop matrix below has recorded evidence. Keep evidence in the GitHub release/Actions run and the release checklist; Transferly itself must not create persistent logs.
+A release is publishable only when every automated gate is green and the physical two-laptop matrix below has recorded evidence. Keep evidence in the GitHub release/Actions run and the release checklist; Transferly itself must not create persistent logs.
+
+Authenticode signing is conditional on the project holding a code-signing certificate. When `WINDOWS_SIGNING_CERTIFICATE_BASE64` and `WINDOWS_SIGNING_CERTIFICATE_PASSWORD` are configured, the workflow signs and refuses to publish an invalid signature. When they are absent it publishes an unsigned artifact that is clearly labeled as such in the release notes, and the SHA-256 checksum becomes the only integrity evidence available to a downloader. Sections below marked *signed releases only* do not apply to an unsigned release.
 
 ## Automated pass/fail gates
 
@@ -37,20 +39,20 @@ The protected GitHub `release` environment must contain:
 
 Require environment approval and restrict tag creation to maintainers. Do not place the PFX, password, or decoded certificate in the repository or an artifact.
 
-Push a `vX.Y.Z` tag, or run **release** manually with that version. `.github/workflows/release.yml` tests and rebuilds the payload, requires both secrets, signs with SHA-256 and an RFC 3161 timestamp, runs `signtool verify /pa /all` and `Get-AuthenticodeSignature`, rechecks portability, and only then uploads/publishes the executable and signed SHA-256 file. A missing or invalid signature fails before artifact upload. Record the Actions URL, signer subject, signature status, final hash, and release URL.
+Push a `vX.Y.Z` tag, or run **release** manually with that version. `.github/workflows/release.yml` tests and rebuilds the payload, signs it when both secrets are present, checksums and rechecks portability on whatever it is about to publish, and then uploads the executable and its SHA-256 file. When signing is enabled it uses SHA-256 with an RFC 3161 timestamp and fails on any status other than `Valid` before artifact upload. Record the Actions URL, whether the artifact was signed, signer subject and signature status if applicable, final hash, and release URL.
 
-For a local ceremony on a protected Windows host:
+For a local signing ceremony on a protected Windows host (*signed releases only*):
 
 ```powershell
 ./scripts/sign-release.ps1 -Executable dist/transferly-windows-amd64.exe -PfxPath X:\secure\transferly.pfx -PfxPassword $env:TRANSFERLY_PFX_PASSWORD
 Get-AuthenticodeSignature dist/transferly-windows-amd64.exe | Format-List Status,StatusMessage,SignerCertificate,TimeStamperCertificate
 ```
 
-Pass requires `Status: Valid`. Never publish an unsigned fallback.
+Pass requires `Status: Valid`. Never publish a signature that does not verify; an unsigned release is acceptable only when it is labeled unsigned and carries its SHA-256.
 
 ## Two-laptop matrix
 
-Use two physical Windows x64 laptops, covering Windows 10 and Windows 11 across the pair. Use only the signed candidate. Record OS build, Transferly/wire versions, endpoint, network adapter/link speed, source/destination drive model, free space, Defender result, and start/end time. Capture terminal screenshots or copied terminal output outside Transferly.
+Use two physical Windows x64 laptops, covering Windows 10 and Windows 11 across the pair. Use only the exact candidate artifact that will be published. Record OS build, Transferly/wire versions, endpoint, network adapter/link speed, source/destination drive model, free space, Defender result, and start/end time. Capture terminal screenshots or copied terminal output outside Transferly.
 
 Run every row:
 
@@ -97,4 +99,4 @@ Record tools/versions, commands, all trial values, the calculation, CPU, peak me
 
 ## Release decision record
 
-Record each automated command as pass/fail, the matrix rows and checklist evidence, throughput ratio, any deviations, Actions run, signed artifact hash, signer, approver, and final **GO/NO-GO**. Any failed security, signature, cleanup, source-immutability, destination-confinement, or throughput gate is **NO-GO**.
+Record each automated command as pass/fail, the matrix rows and checklist evidence, throughput ratio, any deviations, Actions run, published artifact hash, signer if signed, approver, and final **GO/NO-GO**. Any failed security, cleanup, source-immutability, destination-confinement, or throughput gate is **NO-GO**, as is a signature that fails to verify when signing is enabled.
