@@ -6,7 +6,7 @@ Authenticode signing is conditional on the project holding a code-signing certif
 
 ## Automated pass/fail gates
 
-Run from a clean checkout with Go 1.22 or newer:
+Run from a clean checkout with Go 1.26 or newer:
 
 ```powershell
 go test ./...

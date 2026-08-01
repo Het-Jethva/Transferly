@@ -21,7 +21,7 @@ Content is protected separately from the channel. Every file in a Transfer Offer
 ## Requirements
 
 - Windows 10 or 11 x64
-- Go 1.22 or newer to build from source
+- Go 1.26 or newer to build from source
 
 ## Build
 
