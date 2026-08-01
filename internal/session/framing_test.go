@@ -47,10 +47,15 @@ func TestVerificationCodeDerivationHasAKnownSixDigitResult(t *testing.T) {
 
 func FuzzProtocolFrameLengthHandling(f *testing.F) {
 	f.Add([]byte(`{"type":"activity"}`))
+	f.Add([]byte("{}\n"))
 	f.Add(bytes.Repeat([]byte{'x'}, maximumFrameBytes))
 	f.Fuzz(func(t *testing.T, payload []byte) {
 		if len(payload) > maximumFrameBytes+1 {
 			payload = payload[:maximumFrameBytes+1]
+		}
+		// The property requires the canary to be the next frame.
+		if delimiter := bytes.IndexByte(payload, '\n'); delimiter >= 0 {
+			payload = payload[:delimiter]
 		}
 		stream := append(append(append([]byte(nil), payload...), '\n'), []byte(`{"type":"canary"}`+"\n")...)
 		reader := bufio.NewReaderSize(bytes.NewReader(stream), maximumFrameBytes)
