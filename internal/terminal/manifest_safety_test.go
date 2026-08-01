@@ -108,8 +108,8 @@ func TestConflictResolutionReservesEveryPreviewedTopLevelPath(t *testing.T) {
 func TestPreparingIncomingContentRejectsAReparsePointInDestinationPath(t *testing.T) {
 	target := t.TempDir()
 	link := filepath.Join(t.TempDir(), "destination-link")
-	if err := os.Symlink(target, link); err != nil {
-		t.Skipf("cannot create test symbolic link: %v", err)
+	if err := createDestinationReparsePoint(link, target); err != nil {
+		t.Fatalf("create destination reparse point: %v", err)
 	}
 	incoming := &incomingOffer{destination: filepath.Join(link, "received"), manifest: offerManifest{}}
 	if err := prepareIncoming(incoming); err == nil || !strings.Contains(err.Error(), "destination is unsafe") {
