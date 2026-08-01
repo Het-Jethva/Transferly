@@ -10,6 +10,8 @@ import (
 	"github.com/Het-Jethva/Transferly/internal/session"
 )
 
+const progressReportInterval = time.Second
+
 // offerProgress combines per-file progress with an aggregate, bounded view of
 // one active Transfer Offer. It retains one counter per active stream, not file
 // content, so its memory use is independent of transferred byte counts.
@@ -24,30 +26,31 @@ type offerProgress struct {
 	fileSizes      map[string]int64
 	aggregateBytes int64
 	completedFiles int
+	lastReported   time.Time
+	reported       bool
 }
 
 func newOfferProgress(app *App, fileCount int, totalBytes int64) *offerProgress {
+	now := app.clock.Now()
 	return &offerProgress{
 		app:        app,
 		fileCount:  fileCount,
 		totalBytes: totalBytes,
-		started:    time.Now(),
+		started:    now,
 		active:     make(map[string]int64, 4),
 		fileSizes:  make(map[string]int64, 4),
 	}
 }
 
 func (p *offerProgress) begin(path string, size int64) (session.Progress, func()) {
-	legacy := p.app.progress("Sending "+path, size)
 	p.mu.Lock()
 	p.active[path] = 0
 	p.fileSizes[path] = size
-	p.reportLocked(path)
+	p.reportIfDueLocked(path)
 	p.mu.Unlock()
 
 	last := int64(0)
 	observe := func(completed int64) {
-		legacy(completed)
 		p.mu.Lock()
 		delta := completed - last
 		if delta > 0 {
@@ -55,9 +58,7 @@ func (p *offerProgress) begin(path string, size int64) (session.Progress, func()
 			last = completed
 		}
 		p.active[path] = completed
-		if completed == 0 || completed == size || completed%(1024*1024) < delta {
-			p.reportLocked(path)
-		}
+		p.reportIfDueLocked(path)
 		p.mu.Unlock()
 	}
 	finished := func() {
@@ -82,7 +83,17 @@ func (p *offerProgress) complete(path string, succeeded bool) {
 	}
 }
 
-func (p *offerProgress) reportLocked(current string) {
+func (p *offerProgress) reportIfDueLocked(current string) {
+	now := p.app.clock.Now()
+	if p.reported && now.Sub(p.lastReported) < progressReportInterval {
+		return
+	}
+	p.reportLocked(current, now)
+}
+
+func (p *offerProgress) reportLocked(current string, now time.Time) {
+	p.reported = true
+	p.lastReported = now
 	paths := make([]string, 0, len(p.active))
 	for path := range p.active {
 		paths = append(paths, path)
@@ -90,7 +101,7 @@ func (p *offerProgress) reportLocked(current string) {
 	sort.Strings(paths)
 	currentBytes := p.active[current]
 	currentTotal := p.fileSizes[current]
-	elapsed := time.Since(p.started)
+	elapsed := now.Sub(p.started)
 	rate := float64(0)
 	if elapsed > 0 {
 		rate = float64(p.aggregateBytes) / elapsed.Seconds()
