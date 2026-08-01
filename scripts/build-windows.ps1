@@ -1,8 +1,7 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
-    [ValidatePattern('^v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$')]
-    [string]$Version,
+    [ValidateNotNullOrEmpty()]
+    [string]$Version = 'dev',
 
     [string]$OutputDirectory = (Join-Path $PSScriptRoot '..\dist')
 )
@@ -25,9 +24,9 @@ function Get-Sha256Hex([string]$Path) {
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $output = [System.IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Force -Path $output | Out-Null
-$artifact = Join-Path $output 'transferly-windows-amd64.exe'
-$first = Join-Path $output '.transferly-repro-1.exe'
-$second = Join-Path $output '.transferly-repro-2.exe'
+$artifact = Join-Path $output 'transferly.exe'
+$first = Join-Path $output '.transferly-build-1.exe'
+$second = Join-Path $output '.transferly-build-2.exe'
 
 try {
     $env:CGO_ENABLED = '0'
@@ -38,9 +37,9 @@ try {
     Push-Location $repositoryRoot
     try {
         & go build -buildvcs=false -trimpath -ldflags $ldflags -o $first ./cmd/transferly
-        if ($LASTEXITCODE -ne 0) { throw 'first Windows release build failed' }
+        if ($LASTEXITCODE -ne 0) { throw 'first Windows build failed' }
         & go build -buildvcs=false -trimpath -ldflags $ldflags -o $second ./cmd/transferly
-        if ($LASTEXITCODE -ne 0) { throw 'second Windows release build failed' }
+        if ($LASTEXITCODE -ne 0) { throw 'second Windows build failed' }
     }
     finally {
         Pop-Location
@@ -49,7 +48,7 @@ try {
     $firstHash = Get-Sha256Hex $first
     $secondHash = Get-Sha256Hex $second
     if ($firstHash -ne $secondHash) {
-        throw "release build is not reproducible: $firstHash differs from $secondHash"
+        throw "Windows build is not reproducible: $firstHash differs from $secondHash"
     }
 
     # Fault injection is compiled out by the absence of the transferly_faults
@@ -64,16 +63,14 @@ try {
             if ($bytes[$i + $j] -ne $marker[$j]) { $matched = $false; break }
         }
         if ($matched) {
-            throw 'release build contains fault-injection code; refusing to publish an injectable artifact'
+            throw 'Windows build contains fault-injection code'
         }
     }
 
     Move-Item -Force $first $artifact
     Remove-Item -Force $second
-    "$($firstHash.ToLowerInvariant())  transferly-windows-amd64.exe" |
-        Set-Content -Encoding ascii -NoNewline (Join-Path $output 'transferly-windows-amd64.exe.sha256')
 
-    Write-Host "Reproducible unsigned release payload: $artifact"
+    Write-Host "Reproducible portable Windows executable: $artifact"
     Write-Host "SHA-256: $firstHash"
 }
 finally {

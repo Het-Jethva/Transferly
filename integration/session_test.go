@@ -108,7 +108,7 @@ func TestMain(m *testing.M) {
 
 // buildFaultExecutable builds the injectable variant. Fault behavior lives
 // behind the transferly_faults build tag so the default executable under test
-// -- and every released artifact -- contains no fault branch at all.
+// -- and every default build -- contains no fault branch at all.
 func buildFaultExecutable(destination string, extraArguments ...string) error {
 	arguments := append([]string{"-tags", "transferly_faults"}, extraArguments...)
 	return buildExecutable(destination, arguments...)

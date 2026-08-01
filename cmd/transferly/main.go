@@ -10,10 +10,10 @@ import (
 	"github.com/Het-Jethva/Transferly/internal/terminal"
 )
 
-// wireMajor is a string so release builds can set it with -ldflags -X while
+// wireMajor is a string so portable builds can set it with -ldflags -X while
 // keeping wire-protocol versioning independent from the executable version.
 var (
-	buildVersion = "dev" // Set for releases with -ldflags "-X main.buildVersion=vX.Y.Z".
+	buildVersion = "dev" // Set by build scripts with -ldflags "-X main.buildVersion=<version>".
 	wireMajor    = "3"
 	wireMinor    = "0"
 )
@@ -38,7 +38,7 @@ func main() {
 		flag.PrintDefaults()
 		fmt.Fprintln(output, "")
 		fmt.Fprintln(output, "No configuration, identity, trust, history, logs, telemetry, relay, or update checks are created.")
-		fmt.Fprintf(output, "Build: Transferly %s; wire protocol %s.%s. Updates are manual executable replacement.\n", buildVersion, wireMajor, wireMinor)
+		fmt.Fprintf(output, "Build: Transferly %s; wire protocol %s.%s.\n", buildVersion, wireMajor, wireMinor)
 	}
 	listenAddress := flag.String("listen", "0.0.0.0:0", "numeric IPv4 address and port (port 0 selects an available dynamic port)")
 	computerName := flag.String("name", "", "temporary computer name advertised to Available Peers")

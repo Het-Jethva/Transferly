@@ -1,4 +1,5 @@
 /transferly
 /transferly.exe
+/dist/
 *.test
 *.test.exe

@@ -16,7 +16,7 @@ jobs:
         with:
           go-version: "1.26.x"
           cache: false
-      - name: Lint release build
+      - name: Lint default build
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12.2
@@ -87,7 +87,7 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-  portable-windows-package:
+  portable-windows-build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -95,9 +95,9 @@ jobs:
         with:
           go-version: "1.26.x"
           cache: false
-      - name: Reproducible Windows x64 build
+      - name: Reproducible portable Windows build
         shell: pwsh
-        run: ./scripts/build-release.ps1 -Version v0.0.0-ci -OutputDirectory dist
+        run: ./scripts/build-windows.ps1 -Version v0.0.0-ci -OutputDirectory dist
       - name: Installer-free and persistence check
         shell: pwsh
-        run: ./scripts/verify-portable.ps1 -Executable dist/transferly-windows-amd64.exe -ExpectedVersion v0.0.0-ci
+        run: ./scripts/verify-portable.ps1 -Executable dist/transferly.exe -ExpectedVersion v0.0.0-ci
